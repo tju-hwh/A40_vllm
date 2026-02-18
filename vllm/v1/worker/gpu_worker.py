@@ -95,6 +95,41 @@ class Worker(WorkerBase):
         else:
             self.profiler = None
 
+        # Decode-only torch profiling (CUDA kernels).
+        #
+        # vLLM requests typically run a few "prefill" iterations (processing
+        # prompt tokens) followed by many "decode" iterations (autoregressive,
+        # usually 1 token per request per iteration). When you only want to
+        # profile decode CUDA operators, it's often better to start the torch
+        # profiler at the beginning of decode rather than around the whole
+        # request.
+        #
+        # Controls:
+        # - VLLM_TORCH_PROFILE=1 enables decode-only profiling.
+        # - VLLM_PROFILE_STEPS sets number of decode iterations to capture.
+        # - VLLM_TORCH_PROFILE_ALL_RANKS=1 profiles all ranks (default: only rank 0).
+        #
+        # Note: VLLM_TORCH_PROFILER_DIR must be set to enable the profiler.
+        self._decode_profile_enabled = os.environ.get("VLLM_TORCH_PROFILE",
+                                                     "0") == "1"
+        self._decode_profile_all_ranks = os.environ.get(
+            "VLLM_TORCH_PROFILE_ALL_RANKS", "0") == "1"
+        self._decode_profile_total_steps = int(
+            os.environ.get("VLLM_PROFILE_STEPS", "3"))
+        self._decode_profile_steps_left = self._decode_profile_total_steps
+        self._decode_profile_started = False
+        self._decode_profile_done = False
+
+        if self._decode_profile_enabled and self.profiler is None:
+            logger.warning(
+                "VLLM_TORCH_PROFILE=1 but VLLM_TORCH_PROFILER_DIR is not set; "
+                "decode-only profiling is disabled.")
+            self._decode_profile_enabled = False
+
+        if (self._decode_profile_enabled and not self._decode_profile_all_ranks
+                and self.rank != 0):
+            self._decode_profile_enabled = False
+
     def sleep(self, level: int = 1) -> None:
         from vllm.device_allocator.cumem import CuMemAllocator
 
@@ -428,6 +463,32 @@ class Worker(WorkerBase):
         self,
         scheduler_output: "SchedulerOutput",
     ) -> Optional[Union[ModelRunnerOutput, AsyncModelRunnerOutput]]:
+        stop_decode_profile_after_step = False
+        if self._decode_profile_enabled and not self._decode_profile_done:
+            # Decode-step heuristic:
+            # - No new requests are introduced in this step.
+            # - At least one request is scheduled.
+            # - All scheduled requests have exactly 1 token scheduled.
+            #
+            # This matches the common post-prefill decode loop. It intentionally
+            # excludes the first scheduling step (which introduces new reqs).
+            is_decode_step = (
+                scheduler_output.total_num_scheduled_tokens > 0 and
+                (not scheduler_output.scheduled_new_reqs) and
+                bool(scheduler_output.num_scheduled_tokens) and max(
+                    scheduler_output.num_scheduled_tokens.values()) == 1)
+
+            if is_decode_step:
+                if not self._decode_profile_started:
+                    logger.info(
+                        "Starting decode-only torch profiler (rank=%s) for %d decode steps.",
+                        self.rank, self._decode_profile_total_steps)
+                    self.profiler.start()
+                    self._decode_profile_started = True
+                self._decode_profile_steps_left -= 1
+                if self._decode_profile_steps_left <= 0:
+                    stop_decode_profile_after_step = True
+
         intermediate_tensors = None
         forward_pass = scheduler_output.total_num_scheduled_tokens > 0
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
@@ -444,8 +505,18 @@ class Worker(WorkerBase):
                     all_gather_group=get_tp_group(),
                     all_gather_tensors=all_gather_tensors))
 
-        output = self.model_runner.execute_model(scheduler_output,
-                                                 intermediate_tensors)
+        try:
+            output = self.model_runner.execute_model(scheduler_output,
+                                                     intermediate_tensors)
+        finally:
+            if (stop_decode_profile_after_step and self._decode_profile_started
+                    and not self._decode_profile_done):
+                logger.info(
+                    "Stopping decode-only torch profiler (rank=%s). Trace saved to %s",
+                    self.rank, envs.VLLM_TORCH_PROFILER_DIR)
+                self.profiler.stop()
+                self._decode_profile_done = True
+
         if isinstance(output, (ModelRunnerOutput, AsyncModelRunnerOutput)):
             return output
 

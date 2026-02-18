@@ -55,6 +55,11 @@ from vllm.utils import Counter, Device, as_iter, is_list_of
 from vllm.v1.engine.llm_engine import LLMEngine
 from vllm.v1.sample.logits_processor import LogitsProcessor
 
+import os
+import torch
+from torch.profiler import profile, ProfilerActivity, schedule, record_function
+
+
 if TYPE_CHECKING:
     from vllm.v1.metrics.reader import Metric
 
@@ -1591,13 +1596,52 @@ class LLM:
                 postfix=(f"est. speed input: {0:.2f} toks/s, "
                          f"output: {0:.2f} toks/s"),
             )
+            
+        my_global_steps = int(os.environ.get('my_global_steps'))
+        print(f"mylog: my_global_steps {my_global_steps}")
+        
+        # ----------------------------
+        # torch.profiler 控制
+        # ----------------------------
+        enable_prof = os.environ.get("VLLM_TORCH_PROFILE", "0") == "1"
+        prof_active_steps = int(os.environ.get("VLLM_PROFILE_STEPS", "3"))
 
+        prof = None
+        if enable_prof:
+            prof = profile(
+                activities=[
+                    ProfilerActivity.CPU,
+                    ProfilerActivity.CUDA,
+                ],
+                schedule=schedule(
+                    wait=1,        # 跳过第 1 个 decode step
+                    warmup=1,      # warmup 1 step
+                    active=prof_active_steps,
+                    repeat=1,
+                ),
+                on_trace_ready=torch.profiler.tensorboard_trace_handler(
+                    "/tmp/vllm_torch_prof"
+                ),
+                record_shapes=True,
+                profile_memory=True,
+                with_stack=True,
+            )
+            prof.__enter__()
+            print("[vLLM] torch.profiler enabled")
+        
         # Run the engine.
         outputs: list[Union[RequestOutput, PoolingRequestOutput]] = []
         total_in_toks = 0
         total_out_toks = 0
+        step_idx = 0
+        
         while self.llm_engine.has_unfinished_requests():
-            step_outputs = self.llm_engine.step()
+            with record_function("vllm_engine_step"):
+                step_outputs = self.llm_engine.step()
+            step_idx+=1
+            if prof is not None:
+                prof.step()
+                
             for output in step_outputs:
                 if output.finished:
                     outputs.append(output)
@@ -1621,8 +1665,13 @@ class LLM:
                         if pbar.n == num_requests:
                             pbar.refresh()
 
+        
         if use_tqdm:
             pbar.close()
+            
+        if prof is not None:
+            prof.__exit__(None, None, None)
+            print("[vLLM] torch.profiler finished")
         # Sort the outputs by request ID.
         # This is necessary because some requests may be finished earlier than
         # its previous requests.
