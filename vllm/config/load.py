@@ -47,6 +47,8 @@ class LoadConfig:
     https://github.com/ggml-org/ggml/blob/master/docs/gguf.md).\n
     - "mistral" will load weights from consolidated safetensors files used by
     Mistral models.
+    - "ipc_weight_share" is an experimental loader where one owner process
+    exports CUDA IPC metadata and consumer processes rebuild parameters from it.
     - Other custom values can be supported via plugins."""
     download_dir: Optional[str] = None
     """Directory to download and load the weights, default to the default

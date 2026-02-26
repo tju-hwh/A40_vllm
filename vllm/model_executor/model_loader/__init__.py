@@ -14,6 +14,8 @@ from vllm.model_executor.model_loader.bitsandbytes_loader import (
 from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
 from vllm.model_executor.model_loader.dummy_loader import DummyModelLoader
 from vllm.model_executor.model_loader.gguf_loader import GGUFModelLoader
+from vllm.model_executor.model_loader.ipc_weight_share_loader import (
+    IPCWeightShareModelLoader)
 from vllm.model_executor.model_loader.runai_streamer_loader import (
     RunaiModelStreamerLoader)
 from vllm.model_executor.model_loader.sharded_state_loader import (
@@ -35,6 +37,7 @@ LoadFormats = Literal[
     "mistral",
     "npcache",
     "pt",
+    "ipc_weight_share",
     "runai_streamer",
     "runai_streamer_sharded",
     "safetensors",
@@ -50,6 +53,7 @@ _LOAD_FORMAT_TO_MODEL_LOADER: dict[str, type[BaseModelLoader]] = {
     "mistral": DefaultModelLoader,
     "npcache": DefaultModelLoader,
     "pt": DefaultModelLoader,
+    "ipc_weight_share": IPCWeightShareModelLoader,
     "runai_streamer": RunaiModelStreamerLoader,
     "runai_streamer_sharded": ShardedStateLoader,
     "safetensors": DefaultModelLoader,
@@ -132,6 +136,7 @@ __all__ = [
     "GGUFModelLoader",
     "DefaultModelLoader",
     "DummyModelLoader",
+    "IPCWeightShareModelLoader",
     "RunaiModelStreamerLoader",
     "ShardedStateLoader",
     "TensorizerLoader",
