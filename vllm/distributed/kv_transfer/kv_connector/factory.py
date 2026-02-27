@@ -111,3 +111,8 @@ KVConnectorFactory.register_connector(
     "OffloadingConnector",
     "vllm.distributed.kv_transfer.kv_connector.v1.offloading_connector",
     "OffloadingConnector")
+
+KVConnectorFactory.register_connector(
+    "CudaIpcConnector",
+    "vllm.distributed.kv_transfer.kv_connector.v1.cuda_ipc_connector",
+    "CudaIpcConnector")

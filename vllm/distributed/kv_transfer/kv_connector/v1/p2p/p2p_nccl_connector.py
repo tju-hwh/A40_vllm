@@ -71,7 +71,8 @@ class P2pNcclConnector(KVConnectorBase_V1):
         self._block_size = vllm_config.cache_config.block_size
         self._requests_need_load: dict[str, Any] = {}
         self.config = vllm_config.kv_transfer_config
-        self.is_producer = self.config.is_kv_producer
+        self.can_send = self.config.is_kv_producer
+        self.can_recv = self.config.is_kv_consumer
         self.chunked_prefill: dict[str, Any] = {}
 
         self._rank = get_world_group().rank \
@@ -104,8 +105,8 @@ class P2pNcclConnector(KVConnectorBase_V1):
             the same.
         """
 
-        # Only consumer/decode loads KV Cache
-        if self.is_producer:
+        # Only recv-capable requests load KV cache.
+        if not self.can_recv:
             return
 
         assert self.p2p_nccl_engine is not None
@@ -168,9 +169,12 @@ class P2pNcclConnector(KVConnectorBase_V1):
                         "num_block:%d, request_id:%s", len(block_ids),
                         num_block, request_id)
 
+        # Warmup/cudagraph capture path may run without request metadata.
+        if self._connector_metadata is None:
+            return
+
         # Get the metadata
-        metadata: KVConnectorMetadata = \
-            self._get_connector_metadata()
+        metadata: KVConnectorMetadata = self._get_connector_metadata()
         assert isinstance(metadata, P2pNcclConnectorMetadata)
 
         if metadata is None:
@@ -179,7 +183,16 @@ class P2pNcclConnector(KVConnectorBase_V1):
         # Load the KV for each request each layer
         for request in metadata.requests:
             request_id = request.request_id
-            ip, port = self.parse_request_id(request_id, False)
+            normalized_request_id = self.normalize_request_id(request_id)
+            # Requests without prefill address are send-only on this hop.
+            if not self.has_prefill_addr(request_id):
+                continue
+            try:
+                ip, port = self.parse_request_id(request_id, False)
+            except ValueError:
+                logger.warning("Skip malformed request id for KV load: %s",
+                               request_id)
+                continue
             remote_address = ip + ":" + str(port + self._rank)
             for layer_name in forward_context.no_compile_layers:
                 layer = forward_context.no_compile_layers[layer_name]
@@ -194,7 +207,7 @@ class P2pNcclConnector(KVConnectorBase_V1):
                 layer = kv_cache[forward_context.virtual_engine]
 
                 kv_cache = self.p2p_nccl_engine.recv_tensor(
-                    request.request_id + "#" + layer_name, remote_address)
+                    normalized_request_id + "#" + layer_name, remote_address)
 
                 if kv_cache is None:
                     logger.warning("🚧kv_cache is None, %s", request.request_id)
@@ -228,8 +241,8 @@ class P2pNcclConnector(KVConnectorBase_V1):
             **kwargs: additional arguments for the save operation.
         """
 
-        # Only producer/prefill saves KV Cache
-        if not self.is_producer:
+        # Only send-capable requests save KV cache.
+        if not self.can_send:
             return
 
         assert self.p2p_nccl_engine is not None
@@ -264,19 +277,33 @@ class P2pNcclConnector(KVConnectorBase_V1):
 
             return None
 
+        # Warmup/cudagraph capture path may run without request metadata.
+        if self._connector_metadata is None:
+            return
+
         connector_metadata = self._get_connector_metadata()
         assert isinstance(connector_metadata, P2pNcclConnectorMetadata)
         for request in connector_metadata.requests:
             request_id = request.request_id
-            ip, port = self.parse_request_id(request_id, True)
+            normalized_request_id = self.normalize_request_id(request_id)
+            # Requests without decode address are recv-only on this hop.
+            if not self.has_decode_addr(request_id):
+                continue
+            try:
+                ip, port = self.parse_request_id(request_id, True)
+            except ValueError:
+                logger.warning("Skip malformed request id for KV save: %s",
+                               request_id)
+                continue
             remote_address = ip + ":" + str(port + self._rank)
 
             kv_cache = extract_kv_from_layer(kv_layer, request.block_ids)
-            self.p2p_nccl_engine.send_tensor(request_id + "#" + layer_name,
+            self.p2p_nccl_engine.send_tensor(normalized_request_id + "#" +
+                                             layer_name,
                                              kv_cache, remote_address)
 
     def wait_for_save(self):
-        if self.is_producer:
+        if self.can_send:
             assert self.p2p_nccl_engine is not None
             self.p2p_nccl_engine.wait_for_sent()
 
@@ -323,7 +350,9 @@ class P2pNcclConnector(KVConnectorBase_V1):
             the number of tokens that can be loaded from the
             external KV cache beyond what is already computed.
         """
-        if self.is_producer:
+        # If this request doesn't encode prefill address in request_id,
+        # there's no remote KV source for this request.
+        if not self.can_recv or not self.has_prefill_addr(request.request_id):
             return 0, False
 
         num_external_tokens = (len(request.prompt_token_ids) - 1 -
@@ -340,7 +369,8 @@ class P2pNcclConnector(KVConnectorBase_V1):
         """
         Update KVConnector state after block allocation.
         """
-        if not self.is_producer and num_external_tokens > 0:
+        if self.can_recv and self.has_prefill_addr(
+                request.request_id) and num_external_tokens > 0:
             self._requests_need_load[request.request_id] = (
                 request, blocks.get_block_ids()[0])
 
@@ -360,7 +390,7 @@ class P2pNcclConnector(KVConnectorBase_V1):
         meta = P2pNcclConnectorMetadata()
 
         for new_req in scheduler_output.scheduled_new_reqs:
-            if self.is_producer:
+            if self.can_send and self.has_decode_addr(new_req.req_id):
                 num_scheduled_tokens = (
                     scheduler_output.num_scheduled_tokens)[new_req.req_id]
                 num_tokens = num_scheduled_tokens + new_req.num_computed_tokens
@@ -375,8 +405,7 @@ class P2pNcclConnector(KVConnectorBase_V1):
                                  token_ids=new_req.prompt_token_ids,
                                  block_ids=new_req.block_ids[0],
                                  block_size=self._block_size)
-                continue
-            if new_req.req_id in self._requests_need_load:
+            if self.can_recv and new_req.req_id in self._requests_need_load:
                 meta.add_request(request_id=new_req.req_id,
                                  token_ids=new_req.prompt_token_ids,
                                  block_ids=new_req.block_ids[0],
@@ -389,11 +418,10 @@ class P2pNcclConnector(KVConnectorBase_V1):
             new_block_ids = cached_reqs.new_block_ids[i]
             resumed_from_preemption = cached_reqs.resumed_from_preemption[i]
 
-            if self.is_producer:
+            if self.can_send and req_id in self.chunked_prefill:
                 num_scheduled_tokens = (
                     scheduler_output.num_scheduled_tokens)[req_id]
                 num_tokens = (num_scheduled_tokens + num_computed_tokens)
-                assert req_id in self.chunked_prefill
                 block_ids = new_block_ids[0]
                 if not resumed_from_preemption:
                     block_ids = (self.chunked_prefill[req_id][0] + block_ids)
@@ -409,13 +437,12 @@ class P2pNcclConnector(KVConnectorBase_V1):
                                  block_ids=block_ids,
                                  block_size=self._block_size)
                 self.chunked_prefill.pop(req_id, None)
-                continue
 
             # NOTE(rob): here we rely on the resumed requests being
             # the first N requests in the list scheduled_cache_reqs.
             if not resumed_from_preemption:
                 break
-            if req_id in self._requests_need_load:
+            if self.can_recv and req_id in self._requests_need_load:
                 request, _ = self._requests_need_load.pop(req_id)
                 total_tokens = num_computed_tokens + 1
                 token_ids = request.all_token_ids[:total_tokens]
@@ -458,11 +485,13 @@ class P2pNcclConnector(KVConnectorBase_V1):
 
     @staticmethod
     def parse_request_id(request_id: str, is_prefill=True) -> tuple[str, int]:
+        request_id = P2pNcclConnector.normalize_request_id(request_id)
+
         # Regular expression to match the string hostname and integer port
         if is_prefill:
-            pattern = r"___decode_addr_(.*):(\d+)"
+            pattern = r"___decode_addr_([^:]+):(\d+)$"
         else:
-            pattern = r"___prefill_addr_(.*):(\d+)___"
+            pattern = r"___prefill_addr_([^:]+):(\d+)___"
 
         # Use re.search to find the pattern in the request_id
         match = re.search(pattern, request_id)
@@ -474,6 +503,24 @@ class P2pNcclConnector(KVConnectorBase_V1):
             return ip, port
         raise ValueError(
             f"Request id {request_id} does not contain hostname and port")
+
+    @staticmethod
+    def has_prefill_addr(request_id: str) -> bool:
+        request_id = P2pNcclConnector.normalize_request_id(request_id)
+        return re.search(r"___prefill_addr_([^:]+):(\d+)___",
+                         request_id) is not None
+
+    @staticmethod
+    def has_decode_addr(request_id: str) -> bool:
+        request_id = P2pNcclConnector.normalize_request_id(request_id)
+        return re.search(r"___decode_addr_([^:]+):(\d+)$",
+                         request_id) is not None
+
+    @staticmethod
+    def normalize_request_id(request_id: str) -> str:
+        # vLLM may append per-choice suffix like "-0" to request ids.
+        # We normalize it so sender/receiver use the same tensor key.
+        return re.sub(r"-\d+$", "", request_id)
 
     @staticmethod
     def check_tensors_except_dim(tensor1, tensor2, dim):

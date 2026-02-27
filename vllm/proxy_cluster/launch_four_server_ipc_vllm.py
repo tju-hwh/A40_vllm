@@ -59,6 +59,8 @@ def _build_vllm_cmd(
     max_model_len: int | None = None,
     enforce_eager: bool | None = None,
     compilation_config: str | None = None,
+    tensor_parallel_size: int | None = None,
+    kv_transfer_config: str | None = None,
 ) -> list[str]:
     cmd = [
         sys.executable,
@@ -85,6 +87,10 @@ def _build_vllm_cmd(
         cmd += ["--enforce-eager"]
     if compilation_config:
         cmd += ["--compilation-config", compilation_config]
+    if tensor_parallel_size is not None:
+        cmd += ["--tensor-parallel-size", str(tensor_parallel_size)]
+    if kv_transfer_config:
+        cmd += ["--kv-transfer-config", kv_transfer_config]
     cmd += extra_args
     return cmd
 
@@ -150,6 +156,28 @@ def _parse_csv(raw: str) -> list[str]:
     return [x.strip() for x in raw.split(",") if x.strip()]
 
 
+def _resolve_kv_transfer_config(raw: str | None, port: int) -> str | None:
+    if not raw:
+        return None
+    replaced = raw.replace("{port}", str(port))
+    try:
+        obj = json.loads(replaced)
+    except Exception:
+        return replaced
+
+    if not isinstance(obj, dict):
+        return replaced
+    if obj.get("kv_connector") != "P2pNcclConnector":
+        return replaced
+
+    extra = obj.get("kv_connector_extra_config")
+    if not isinstance(extra, dict):
+        extra = {}
+        obj["kv_connector_extra_config"] = extra
+    extra.setdefault("http_port", int(port))
+    return json.dumps(obj, separators=(",", ":"))
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Launch 4 real vLLM servers with experimental CUDA IPC shared parameters."
@@ -186,6 +214,12 @@ def main() -> int:
         help="Optional owner override for --max-model-len.",
     )
     parser.add_argument(
+        "--owner-tensor-parallel-size",
+        type=int,
+        default=1,
+        help="Owner server --tensor-parallel-size.",
+    )
+    parser.add_argument(
         "--consumer-gpu-memory-utilization",
         type=float,
         default=0.1,
@@ -202,6 +236,12 @@ def main() -> int:
         type=int,
         default=None,
         help="Optional consumer override for --max-model-len.",
+    )
+    parser.add_argument(
+        "--consumer-tensor-parallel-size",
+        type=int,
+        default=1,
+        help="Consumer server --tensor-parallel-size.",
     )
     parser.add_argument(
         "--no-consumer-enforce-eager",
@@ -224,9 +264,38 @@ def main() -> int:
         help="Optional CSV, one entry per consumer (server2,3,4), e.g. '1,2,3'.",
     )
     parser.add_argument(
+        "--consumer-cuda-visible-devices-all",
+        default="",
+        help="Optional CUDA_VISIBLE_DEVICES applied to all consumer processes, e.g. '0,1'.",
+    )
+    parser.add_argument(
         "--consumer-attention-backend",
         default="TORCH_SDPA",
         help="Set VLLM_ATTENTION_BACKEND for consumers (e.g. TORCH_SDPA/FLASHINFER/FLASH_ATTN).",
+    )
+    parser.add_argument(
+        "--owner-kv-transfer-config",
+        default="",
+        help=(
+            "Optional JSON string for owner --kv-transfer-config. "
+            "Supports {port} placeholder."
+        ),
+    )
+    parser.add_argument(
+        "--consumer-kv-transfer-config",
+        default="",
+        help=(
+            "Optional JSON string for all consumers --kv-transfer-config. "
+            "Supports {port} placeholder."
+        ),
+    )
+    parser.add_argument(
+        "--kv-transfer-config-template",
+        default="",
+        help=(
+            "Optional JSON string applied to owner+consumers when specific flags are empty. "
+            "Supports {port} placeholder."
+        ),
     )
     parser.add_argument(
         "--owner-startup-delay-s",
@@ -271,11 +340,22 @@ def main() -> int:
         poll_s=args.ipc_poll_interval_s,
         extra_args=_strip_overridden_args(
             vllm_extra,
-            {"--gpu-memory-utilization", "--max-num-seqs", "--max-model-len"},
+            {
+                "--gpu-memory-utilization",
+                "--max-num-seqs",
+                "--max-model-len",
+                "--tensor-parallel-size",
+                "--kv-transfer-config",
+            },
         ),
         gpu_memory_utilization=args.owner_gpu_memory_utilization,
         max_num_seqs=args.owner_max_num_seqs,
         max_model_len=args.owner_max_model_len,
+        tensor_parallel_size=args.owner_tensor_parallel_size,
+        kv_transfer_config=_resolve_kv_transfer_config(
+            args.owner_kv_transfer_config or args.kv_transfer_config_template,
+            args.server1_port,
+        ),
     )
     owner_env = dict(base_env)
     if args.owner_cuda_visible_devices:
@@ -299,6 +379,8 @@ def main() -> int:
                 "--max-num-seqs",
                 "--max-model-len",
                 "--compilation-config",
+                "--tensor-parallel-size",
+                "--kv-transfer-config",
             },
         )
         cmd = _build_vllm_cmd(
@@ -315,9 +397,16 @@ def main() -> int:
             max_model_len=args.consumer_max_model_len,
             enforce_eager=not args.no_consumer_enforce_eager,
             compilation_config=args.consumer_compilation_config,
+            tensor_parallel_size=args.consumer_tensor_parallel_size,
+            kv_transfer_config=_resolve_kv_transfer_config(
+                args.consumer_kv_transfer_config or args.kv_transfer_config_template,
+                p,
+            ),
         )
         env = dict(base_env)
-        if idx < len(consumer_visible_devices):
+        if args.consumer_cuda_visible_devices_all:
+            env["CUDA_VISIBLE_DEVICES"] = args.consumer_cuda_visible_devices_all
+        elif idx < len(consumer_visible_devices):
             env["CUDA_VISIBLE_DEVICES"] = consumer_visible_devices[idx]
         if args.consumer_attention_backend:
             env["VLLM_ATTENTION_BACKEND"] = args.consumer_attention_backend

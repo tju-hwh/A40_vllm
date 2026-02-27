@@ -106,6 +106,8 @@ class P2pNcclEngine:
         self.context = zmq.Context()
         self.router_socket = self.context.socket(zmq.ROUTER)
         self.router_socket.bind(f"tcp://{self.zmq_address}")
+        self.zmq_timeout_ms = int(
+            self.config.get_from_extra_config("zmq_timeout_ms", 5000))
 
         self.poller = zmq.Poller()
         self.poller.register(self.router_socket, zmq.POLLIN)
@@ -151,6 +153,9 @@ class P2pNcclEngine:
 
         self.nccl_num_channels = self.config.get_from_extra_config(
             "nccl_num_channels", "8")
+        # Avoid indefinite blocking when expected remote KV never arrives.
+        self.recv_wait_timeout_s = float(
+            self.config.get_from_extra_config("recv_wait_timeout_s", 10.0))
 
         self._listener_thread = threading.Thread(
             target=self.listen_for_requests, daemon=True)
@@ -173,6 +178,9 @@ class P2pNcclEngine:
         if remote_address not in self.socks:
             sock = self.context.socket(zmq.DEALER)
             sock.setsockopt_string(zmq.IDENTITY, self.zmq_address)
+            sock.setsockopt(zmq.RCVTIMEO, self.zmq_timeout_ms)
+            sock.setsockopt(zmq.SNDTIMEO, self.zmq_timeout_ms)
+            sock.setsockopt(zmq.LINGER, 0)
             sock.connect(f"tcp://{remote_address}")
             self.socks[remote_address] = sock
             if remote_address in self.comms:
@@ -263,7 +271,19 @@ class P2pNcclEngine:
             start_time = time.time()
             with self.recv_store_cv:
                 while tensor_id not in self.recv_store:
-                    self.recv_store_cv.wait()
+                    elapsed = time.time() - start_time
+                    remaining = self.recv_wait_timeout_s - elapsed
+                    if remaining <= 0:
+                        logger.warning(
+                            "🔴[PUT]Recv timeout waiting tensor_id=%s "
+                            "from=%s rank=%d timeout=%.3fs",
+                            tensor_id,
+                            remote_address,
+                            self.rank,
+                            self.recv_wait_timeout_s,
+                        )
+                        return None
+                    self.recv_store_cv.wait(timeout=remaining)
                 tensor = self.recv_store[tensor_id]
 
             if tensor is not None:
@@ -293,9 +313,18 @@ class P2pNcclEngine:
         comm, rank = self.comms[remote_address]
 
         data = {"cmd": "GET", "tensor_id": tensor_id}
-        sock.send(msgpack.dumps(data))
-
-        message = sock.recv()
+        try:
+            sock.send(msgpack.dumps(data))
+            message = sock.recv()
+        except zmq.error.Again:
+            logger.warning(
+                "🔴[GET]ZMQ timeout waiting reply from %s, tensor_id:%s, "
+                "timeout_ms:%d",
+                remote_address,
+                tensor_id,
+                self.zmq_timeout_ms,
+            )
+            return None
         data = msgpack.loads(message)
         if data["ret"] != 0:
             logger.warning("🔴[GET]Recv From %s, tensor_id: %s, ret: %d",
@@ -445,9 +474,19 @@ class P2pNcclEngine:
             "shape": tensor.shape,
             "dtype": str(tensor.dtype).replace("torch.", "")
         }
-        sock.send(msgpack.dumps(data))
-
-        response = sock.recv()
+        try:
+            sock.send(msgpack.dumps(data))
+            response = sock.recv()
+        except zmq.error.Again:
+            logger.warning(
+                "🔴[PUT]ZMQ timeout waiting ack, %s 👉 %s, tensor_id:%s, "
+                "timeout_ms:%d",
+                self.zmq_address,
+                item.remote_address,
+                item.tensor_id,
+                self.zmq_timeout_ms,
+            )
+            return False
         if response != b"0":
             logger.error(
                 "🔴Send Tensor, Peer Out Of Memory/Threshold, %s 👉 %s, "

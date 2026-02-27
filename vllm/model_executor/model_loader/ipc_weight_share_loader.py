@@ -80,6 +80,18 @@ class IPCWeightShareModelLoader(BaseModelLoader):
             raise ValueError("ipc_meta_path is required for ipc_weight_share loader")
         return path
 
+    def _ranked_meta_path(self, vllm_config: VllmConfig) -> str:
+        """Use per-rank meta file for TP/DP deployments.
+
+        For TP>1, every rank owns a different parameter shard, so owner rank-i
+        must export its own IPC metadata and consumer rank-i must load it.
+        """
+        base = self._meta_path()
+        p = vllm_config.parallel_config
+        if p.tensor_parallel_size > 1 or p.data_parallel_size > 1:
+            return f"{base}.rank{p.rank}"
+        return base
+
     def _wait_timeout_s(self) -> float:
         return float(self._extra.get("ipc_wait_timeout_s", 600))
 
@@ -136,7 +148,7 @@ class IPCWeightShareModelLoader(BaseModelLoader):
 
     def _load_owner_model(self, vllm_config: VllmConfig, model_config: ModelConfig) -> nn.Module:
         model = DefaultModelLoader(self._owner_default_load_config()).load_model(vllm_config, model_config)
-        meta_path = self._meta_path()
+        meta_path = self._ranked_meta_path(vllm_config)
         meta = export_module_ipc_meta(model)
         payload = {
             "model_name": model_config.model,
@@ -156,7 +168,7 @@ class IPCWeightShareModelLoader(BaseModelLoader):
         load_device = vllm_config.device_config.device if load_config.device is None else load_config.device
         target_device = torch.device(load_device)
 
-        meta_path = self._meta_path()
+        meta_path = self._ranked_meta_path(vllm_config)
         payload = self._wait_and_read_meta_file(meta_path)
         module_meta = payload.get("meta", {})
 
