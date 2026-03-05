@@ -1,0 +1,39 @@
+(verl) root@iZ6wedcy0fz7znx5or9xc3Z:~/vllm# CONCURRENCY=128 NUM_REQUESTS=128 MAX_TOKENS=4096 MAX_MODEL_LEN=5596 GPU_MEMORY_UTIL=0
+.6 bash /root/vllm/scripts/test_baseline_vllm_conc128.sh
+[1/5] cleanup
+[2/5] start baseline vLLM (tp=2)
+[3/5] wait readiness
+curl: (7) Failed to connect to 127.0.0.1 port 8210 after 0 ms: Could not connect to server
+curl: (7) Failed to connect to 127.0.0.1 port 8210 after 0 ms: Could not connect to server
+curl: (7) Failed to connect to 127.0.0.1 port 8210 after 0 ms: Could not connect to server
+curl: (7) Failed to connect to 127.0.0.1 port 8210 after 0 ms: Could not connect to server
+curl: (7) Failed to connect to 127.0.0.1 port 8210 after 0 ms: Could not connect to server
+curl: (7) Failed to connect to 127.0.0.1 port 8210 after 0 ms: Could not connect to server
+curl: (7) Failed to connect to 127.0.0.1 port 8210 after 0 ms: Could not connect to server
+curl: (7) Failed to connect to 127.0.0.1 port 8210 after 0 ms: Could not connect to server
+curl: (7) Failed to connect to 127.0.0.1 port 8210 after 0 ms: Could not connect to server
+curl: (7) Failed to connect to 127.0.0.1 port 8210 after 0 ms: Could not connect to server
+curl: (7) Failed to connect to 127.0.0.1 port 8210 after 0 ms: Could not connect to server
+curl: (7) Failed to connect to 127.0.0.1 port 8210 after 0 ms: Could not connect to server
+READY_BASELINE
+[4/5] run concurrency eval
+{
+  "base_url": "http://127.0.0.1:8210",
+  "model": "/root/model/Qwen2-7B-Instruct",
+  "concurrency": 128,
+  "num_requests": 128,
+  "max_tokens": 4096,
+  "ok_requests": 128,
+  "failed_requests": 0,
+  "avg_latency_s": 15.872490974143147,
+  "p95_latency_s": 26.299488067626953,
+  "run_elapsed_s": 62.33639144897461,
+  "sum_prompt_tokens": 12025,
+  "sum_completion_tokens": 114837,
+  "decode_tok_per_s": 1842.2144325437848,
+  "sample_failures": []
+}
+[5/5] done
+report: /tmp/baseline_vllm_conc128.json
+log: /tmp/baseline_vllm_conc128.log
+(verl) root@iZ6wedcy0fz7znx5or9xc3Z:~/vllm# 
