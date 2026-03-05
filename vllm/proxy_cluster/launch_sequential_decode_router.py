@@ -81,6 +81,12 @@ def main() -> int:
     parser.add_argument("--request-timeout-s", type=float, default=300.0)
     parser.add_argument("--connect-timeout-s", type=float, default=30.0)
     parser.add_argument(
+        "--upstream-max-model-len",
+        type=int,
+        default=3072,
+        help="Per-upstream max_model_len used for per-hop max_tokens clamp.",
+    )
+    parser.add_argument(
         "--max-response-length",
         type=int,
         default=4096,
@@ -166,6 +172,7 @@ def main() -> int:
     env["REQUEST_TIMEOUT_S"] = str(args.request_timeout_s)
     env["CONNECT_TIMEOUT_S"] = str(args.connect_timeout_s)
     env["MAX_RESPONSE_LENGTH"] = str(max(1, int(args.max_response_length)))
+    env["UPSTREAM_MAX_MODEL_LEN"] = str(max(1, int(args.upstream_max_model_len)))
     env["PROXY_VERBOSE_LOG"] = "1" if args.verbose_log else "0"
     env["REQUIRE_KV_TRANSFER"] = "1" if args.require_kv_transfer else "0"
     env["DYNAMIC_KV_CONTROL_PATH"] = args.dynamic_kv_control_path
@@ -212,6 +219,7 @@ def main() -> int:
         f"  block size: {args.block_size}\n"
         f"  decode cutovers: {args.decode_cutovers}\n"
         f"  max response length: {args.max_response_length}\n"
+        f"  upstream max model len: {args.upstream_max_model_len}\n"
         f"  dynamic kv control path: {args.dynamic_kv_control_path or '(disabled)'}\n"
         f"  kv owner state url: {args.kv_owner_state_url or '(disabled)'}\n"
         f"  targets: {args.server1_url}, {args.server2_url}, {args.server3_url}, {args.server4_url}\n"

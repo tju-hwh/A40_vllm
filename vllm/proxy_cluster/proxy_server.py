@@ -47,6 +47,7 @@ class ProxyConfig:
     kv_owner_state_url: str
     kv_owner_state_strict: bool
     max_response_length: int
+    upstream_max_model_len: int
 
     @staticmethod
     def from_env() -> "ProxyConfig":
@@ -121,6 +122,8 @@ class ProxyConfig:
             kv_owner_state_url=os.getenv("KV_OWNER_STATE_URL", "").strip(),
             kv_owner_state_strict=_parse_bool(os.getenv("KV_OWNER_STATE_STRICT"), default=False),
             max_response_length=max(1, int(os.getenv("MAX_RESPONSE_LENGTH", "4096"))),
+            upstream_max_model_len=max(
+                1, int(os.getenv("UPSTREAM_MAX_MODEL_LEN", "3072"))),
         )
 
 
@@ -526,7 +529,35 @@ async def _handle_completion_sequential_handoff(
         else:
             # Fallback path when upstream did not return token IDs.
             hop_req["prompt"] = base_prompt + generated_text
-        hop_req["max_tokens"] = hop_max_tokens
+        # Guard against per-hop context overflow:
+        # input_tokens + max_tokens must not exceed upstream max_model_len.
+        effective_hop_max_tokens = int(hop_max_tokens)
+        prompt_obj = hop_req.get("prompt")
+        if isinstance(prompt_obj, list):
+            prompt_len = len(prompt_obj)
+            remain_budget = int(cfg.upstream_max_model_len) - int(prompt_len)
+            if remain_budget <= 0:
+                if last_resp is not None:
+                    # No decode budget left at this hop. End chain gracefully.
+                    choices_obj = last_resp.get("choices")
+                    if isinstance(choices_obj, list) and choices_obj and \
+                            isinstance(choices_obj[0], dict):
+                        choices_obj[0]["finish_reason"] = "length"
+                    break
+                return JSONResponse(
+                    status_code=400,
+                    content={
+                        "error": "context_overflow_before_hop",
+                        "upstream": target_base,
+                        "hop": hop_idx,
+                        "prompt_tokens": prompt_len,
+                        "max_model_len": int(cfg.upstream_max_model_len),
+                        "decode_idx": decode_idx,
+                    },
+                )
+            effective_hop_max_tokens = min(effective_hop_max_tokens,
+                                           int(remain_budget))
+        hop_req["max_tokens"] = max(1, int(effective_hop_max_tokens))
         # Internal chaining requires exact token continuity across hops.
         hop_req["return_token_ids"] = True
         # Keep a stable logical request id and embed prefill/decode addrs for

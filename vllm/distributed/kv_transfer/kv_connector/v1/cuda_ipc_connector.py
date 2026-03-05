@@ -108,6 +108,17 @@ class CudaIpcConnector(KVConnectorBase_V1):
         self._shared_block_table_enable = bool(
             transfer_config.get_from_extra_config("shared_block_table_enable",
                                                   False))
+        # In shared-kv-pool mode, export full layer KV handle and transfer
+        # only block-index metadata to avoid large per-hop contiguous copies.
+        self._shared_kv_pool_enable = bool(
+            transfer_config.get_from_extra_config("shared_kv_pool_enable",
+                                                  False))
+        # True complete-shared-pool mode:
+        # - owner allocates one global KV arena
+        # - consumers only map shared tensors
+        # - handoff skips per-hop KV export/import copy path
+        self._zero_copy_shared_pool_mode = (
+            self._shared_kv_pool_enable and self._shared_block_table_enable)
         os.makedirs(self._ipc_meta_dir, exist_ok=True)
 
         # Keep exported tensors alive while peer imports IPC handles.
@@ -121,6 +132,10 @@ class CudaIpcConnector(KVConnectorBase_V1):
     def start_load_kv(self, forward_context: "ForwardContext",
                       **kwargs: Any) -> None:
         del kwargs
+        if self._zero_copy_shared_pool_mode:
+            # Shared pool + shared block table guarantees remote KV visibility
+            # by construction, so no per-hop import/copy is required.
+            return
         if not self.can_recv:
             return
         if self._connector_metadata is None:
@@ -144,33 +159,36 @@ class CudaIpcConnector(KVConnectorBase_V1):
         def inject_kv_into_layer(layer: torch.Tensor, kv_cache: torch.Tensor,
                                  block_ids: torch.Tensor,
                                  request_id: str,
-                                 layer_name: str) -> None:
+                                 layer_name: str,
+                                 src_block_ids: Optional[torch.Tensor] = None
+                                 ) -> None:
             warn_key = f"{request_id}::{layer_name}"
+            if src_block_ids is None:
+                src_block_ids = block_ids
             if (isinstance(attn_metadata, MLACommonMetadata)
                     or layer.shape[1] == 2):
-                num_block = kv_cache.shape[0]
-                if len(block_ids) == num_block:
-                    layer[block_ids, ...] = kv_cache
-                else:
-                    n = min(int(len(block_ids)), int(num_block))
-                    layer[block_ids[:n], ...] = kv_cache[:n, ...]
+                n = min(int(len(block_ids)), int(len(src_block_ids)))
+                if n > 0:
+                    layer[block_ids[:n], ...] = kv_cache[src_block_ids[:n], ...]
+                if n != int(len(block_ids)):
                     if warn_key not in self._warned_mismatch:
                         self._warned_mismatch.add(warn_key)
                         logger.warning(
-                            "cuda_ipc kv_cache mismatch block_ids=%d num_block=%d req=%s layer=%s",
-                            len(block_ids), num_block, request_id, layer_name)
+                            "cuda_ipc kv_cache mismatch dst=%d src=%d req=%s layer=%s",
+                            len(block_ids), len(src_block_ids), request_id,
+                            layer_name)
             elif layer.shape[0] == 2:
-                num_block = kv_cache.shape[1]
-                if len(block_ids) == num_block:
-                    layer[:, block_ids, ...] = kv_cache
-                else:
-                    n = min(int(len(block_ids)), int(num_block))
-                    layer[:, block_ids[:n], ...] = kv_cache[:, :n, ...]
+                n = min(int(len(block_ids)), int(len(src_block_ids)))
+                if n > 0:
+                    layer[:, block_ids[:n], ...] = kv_cache[:, src_block_ids[:n],
+                                                             ...]
+                if n != int(len(block_ids)):
                     if warn_key not in self._warned_mismatch:
                         self._warned_mismatch.add(warn_key)
                         logger.warning(
-                            "cuda_ipc kv_cache mismatch block_ids=%d num_block=%d req=%s layer=%s",
-                            len(block_ids), num_block, request_id, layer_name)
+                            "cuda_ipc kv_cache mismatch dst=%d src=%d req=%s layer=%s",
+                            len(block_ids), len(src_block_ids), request_id,
+                            layer_name)
 
         for request in metadata.requests:
             req_id = request.request_id
@@ -216,6 +234,7 @@ class CudaIpcConnector(KVConnectorBase_V1):
                 # Default path: inject into this worker's local block IDs that
                 # correspond to currently valid tokens only.
                 dst_block_ids = request.block_ids[:expected_blocks]
+                src_block_ids = dst_block_ids
                 if self._kv_owner_state_url:
                     # Prefer owner-state record; fallback to deterministic key
                     # for robustness when register/lookup races happen.
@@ -228,12 +247,12 @@ class CudaIpcConnector(KVConnectorBase_V1):
                             if isinstance(rec_block_ids, list):
                                 try:
                                     rec_ids = [int(x) for x in rec_block_ids]
-                                    dst_block_ids = torch.tensor(
+                                    src_block_ids = torch.tensor(
                                         rec_ids[:expected_blocks],
                                         dtype=request.block_ids.dtype,
                                     )
                                 except Exception:
-                                    dst_block_ids = request.block_ids[
+                                    src_block_ids = request.block_ids[
                                         :expected_blocks]
                     else:
                         logger.warning(
@@ -272,7 +291,7 @@ class CudaIpcConnector(KVConnectorBase_V1):
                 # in default mode. In global shared-allocator mode, owner-state
                 # may provide globally consistent block_ids for direct inject.
                 inject_kv_into_layer(layer_kv, remote_kv, dst_block_ids,
-                                     req_id, layer_key)
+                                     req_id, layer_key, src_block_ids)
             if load_errors:
                 logger.warning("cuda_ipc load degraded req=%s errors=%d",
                                req_id, len(load_errors))
@@ -294,6 +313,9 @@ class CudaIpcConnector(KVConnectorBase_V1):
                       attn_metadata: "AttentionMetadata",
                       **kwargs: Any) -> None:
         del kwargs
+        if self._zero_copy_shared_pool_mode:
+            # Complete shared-pool mode: skip per-hop export.
+            return
         if not self.can_send:
             return
         if self._connector_metadata is None:
@@ -304,6 +326,9 @@ class CudaIpcConnector(KVConnectorBase_V1):
 
         def extract_kv_from_layer(layer: torch.Tensor,
                                   block_ids: torch.Tensor) -> torch.Tensor:
+            if self._shared_kv_pool_enable:
+                # Full tensor export path: avoid per-hop contiguous slicing.
+                return layer
             if (isinstance(attn_metadata, MLACommonMetadata)
                     or layer.shape[1] == 2):
                 return layer[block_ids, ...]
@@ -336,7 +361,8 @@ class CudaIpcConnector(KVConnectorBase_V1):
             kv_cache = extract_kv_from_layer(kv_layer, used_block_ids)
             if not kv_cache.is_cuda:
                 continue
-            kv_cache = kv_cache.contiguous()
+            if not self._shared_kv_pool_enable:
+                kv_cache = kv_cache.contiguous()
             if kv_cache.dim() == 0:
                 continue
 
@@ -344,7 +370,10 @@ class CudaIpcConnector(KVConnectorBase_V1):
             # Deterministic tensor key per request/layer-device.
             # Old keys are guarded by request-id uniqueness + owner-state reset.
             tensor_key = f"{base_req}#{layer_key}"
-            self._inflight_exports[tensor_key] = (kv_cache, time.time())
+            # For full-tensor export path, kv tensor is model-owned and
+            # long-lived. No need to hold per-request in-flight refs.
+            if not self._shared_kv_pool_enable:
+                self._inflight_exports[tensor_key] = (kv_cache, time.time())
             exported_blocks = int(valid_blocks)
             exported_block_ids = [
                 int(x) for x in used_block_ids[:exported_blocks].tolist()

@@ -66,6 +66,7 @@ nohup /root/anaconda3/envs/verl/bin/python -m vllm.proxy_cluster.launch_sequenti
   --server4-url http://127.0.0.1:8104 \
   --routing-mode sequential_handoff \
   --decode-cutovers "$CUTOVERS" \
+  --upstream-max-model-len 3072 \
   --verbose-log \
   --kv-owner-state-url http://127.0.0.1:8300 \
   --skip-wait-upstreams-ready \

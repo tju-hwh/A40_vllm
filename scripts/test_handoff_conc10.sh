@@ -15,10 +15,12 @@ CONSUMER_GPU_MEM_UTIL=${CONSUMER_GPU_MEM_UTIL:-"0.6"}
 CUTOVERS=${CUTOVERS:-"512,512,512"}
 MAX_MODEL_LEN=${MAX_MODEL_LEN:-"3072"}
 
-CONCURRENCY=${CONCURRENCY:-"10"}
-NUM_REQUESTS=${NUM_REQUESTS:-"10"}
-MAX_TOKENS=${MAX_TOKENS:-"2048"}
+CONCURRENCY=${CONCURRENCY:-"128"}
+NUM_REQUESTS=${NUM_REQUESTS:-"128"}
+MAX_TOKENS=${MAX_TOKENS:-"4096"}
 TIMEOUT_S=${TIMEOUT_S:-"900"}
+OWNER_MAX_NUM_SEQS=${OWNER_MAX_NUM_SEQS:-"$CONCURRENCY"}
+CONSUMER_MAX_NUM_SEQS=${CONSUMER_MAX_NUM_SEQS:-"$CONCURRENCY"}
 
 if command -v rg >/dev/null 2>&1; then
   MATCH_BIN="rg"
@@ -59,7 +61,7 @@ nohup /root/anaconda3/envs/verl/bin/python -m vllm.proxy_cluster.launch_four_ser
   --server1-port 8101 --server2-port 8102 --server3-port 8103 --server4-port 8104 \
   --owner-gpu-memory-utilization "$OWNER_GPU_MEM_UTIL" \
   --consumer-gpu-memory-utilization "$CONSUMER_GPU_MEM_UTIL" \
-  --owner-max-num-seqs 4 --consumer-max-num-seqs 4 \
+  --owner-max-num-seqs "$OWNER_MAX_NUM_SEQS" --consumer-max-num-seqs "$CONSUMER_MAX_NUM_SEQS" \
   --owner-max-model-len "$MAX_MODEL_LEN" --consumer-max-model-len "$MAX_MODEL_LEN" \
   --owner-startup-delay-s 2 --owner-ready-timeout-s 600 \
   --owner-cuda-visible-devices 0,1 \
@@ -82,6 +84,7 @@ nohup /root/anaconda3/envs/verl/bin/python -m vllm.proxy_cluster.launch_sequenti
   --server4-url http://127.0.0.1:8104 \
   --routing-mode sequential_handoff \
   --decode-cutovers "$CUTOVERS" \
+  --upstream-max-model-len "$MAX_MODEL_LEN" \
   --max-response-length 4096 \
   --request-timeout-s 3600 \
   --connect-timeout-s 60 \

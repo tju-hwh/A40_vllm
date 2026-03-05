@@ -45,7 +45,9 @@ class _SharedBlockAllocator:
         state = {
             "num_gpu_blocks": self._num_gpu_blocks,
             # Keep block 0 reserved as null block.
-            "free_blocks": list(range(1, self._num_gpu_blocks)),
+            # free_intervals is a list of inclusive ranges: [[start, end], ...]
+            "free_intervals": [[1, self._num_gpu_blocks - 1]]
+            if self._num_gpu_blocks > 1 else [],
             "refcnt": {},
             # canonical_request_id -> ordered block ids (global block table)
             "req_blocks": {},
@@ -67,7 +69,27 @@ class _SharedBlockAllocator:
             raise RuntimeError(
                 "shared allocator num_gpu_blocks mismatch: "
                 f"{state.get('num_gpu_blocks')} vs {self._num_gpu_blocks}")
-        state.setdefault("free_blocks", [])
+        # Backward-compat: convert legacy free_blocks list to intervals.
+        if "free_intervals" not in state:
+            free_blocks = state.get("free_blocks", [])
+            if not isinstance(free_blocks, list):
+                free_blocks = []
+            free_blocks = sorted(int(x) for x in free_blocks if int(x) > 0)
+            free_intervals: list[list[int]] = []
+            if free_blocks:
+                s = free_blocks[0]
+                e = s
+                for b in free_blocks[1:]:
+                    if b == e + 1:
+                        e = b
+                    else:
+                        free_intervals.append([s, e])
+                        s = b
+                        e = b
+                free_intervals.append([s, e])
+            state["free_intervals"] = free_intervals
+            state.pop("free_blocks", None)
+        state.setdefault("free_intervals", [])
         state.setdefault("refcnt", {})
         state.setdefault("req_blocks", {})
         return state
@@ -89,18 +111,119 @@ class _SharedBlockAllocator:
             finally:
                 fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
 
+    @staticmethod
+    def _num_free_from_intervals(intervals: list[list[int]]) -> int:
+        total = 0
+        for it in intervals:
+            if isinstance(it, list) and len(it) == 2:
+                s = int(it[0])
+                e = int(it[1])
+                if e >= s:
+                    total += (e - s + 1)
+        return int(total)
+
+    @staticmethod
+    def _take_from_intervals(intervals: list[list[int]], n: int) -> list[int]:
+        if n <= 0:
+            return []
+        out: list[int] = []
+        i = 0
+        while i < len(intervals) and len(out) < n:
+            s, e = int(intervals[i][0]), int(intervals[i][1])
+            if e < s:
+                intervals.pop(i)
+                continue
+            need = n - len(out)
+            cnt = min(need, e - s + 1)
+            out.extend(range(s, s + cnt))
+            ns = s + cnt
+            if ns <= e:
+                intervals[i][0] = ns
+                i += 1
+            else:
+                intervals.pop(i)
+        return out
+
+    @staticmethod
+    def _add_ids_to_intervals(intervals: list[list[int]], ids: list[int]) -> None:
+        vals = sorted(int(x) for x in ids if int(x) > 0)
+        if not vals:
+            return
+        for b in vals:
+            inserted = False
+            for j, it in enumerate(intervals):
+                s, e = int(it[0]), int(it[1])
+                if s <= b <= e:
+                    inserted = True
+                    break
+                if b == e + 1:
+                    intervals[j][1] = b
+                    inserted = True
+                    # merge forward
+                    if j + 1 < len(intervals) and int(intervals[j + 1][0]) <= b + 1:
+                        intervals[j][1] = max(int(intervals[j][1]),
+                                              int(intervals[j + 1][1]))
+                        intervals.pop(j + 1)
+                    break
+                if b < s - 1:
+                    intervals.insert(j, [b, b])
+                    inserted = True
+                    break
+                if b == s - 1:
+                    intervals[j][0] = b
+                    inserted = True
+                    break
+            if not inserted:
+                intervals.append([b, b])
+        # Final merge pass.
+        intervals.sort(key=lambda x: int(x[0]))
+        k = 0
+        while k + 1 < len(intervals):
+            s1, e1 = int(intervals[k][0]), int(intervals[k][1])
+            s2, e2 = int(intervals[k + 1][0]), int(intervals[k + 1][1])
+            if s2 <= e1 + 1:
+                intervals[k][1] = max(e1, e2)
+                intervals.pop(k + 1)
+            else:
+                k += 1
+
+    @staticmethod
+    def _remove_specific_from_intervals(intervals: list[list[int]],
+                                        want: list[int]) -> list[int]:
+        out: list[int] = []
+        for bid in sorted(int(x) for x in want if int(x) > 0):
+            for j, it in enumerate(intervals):
+                s, e = int(it[0]), int(it[1])
+                if bid < s:
+                    break
+                if s <= bid <= e:
+                    out.append(bid)
+                    if s == e == bid:
+                        intervals.pop(j)
+                    elif bid == s:
+                        intervals[j][0] = s + 1
+                    elif bid == e:
+                        intervals[j][1] = e - 1
+                    else:
+                        # split interval
+                        left = [s, bid - 1]
+                        right = [bid + 1, e]
+                        intervals[j] = left
+                        intervals.insert(j + 1, right)
+                    break
+        return out
+
     def allocate(self, num_blocks: int) -> list[int]:
         n = int(num_blocks)
         if n <= 0:
             return []
 
         def _op(state: dict[str, Any]) -> list[int]:
-            free_blocks: list[int] = state["free_blocks"]
-            if len(free_blocks) < n:
+            free_intervals: list[list[int]] = state["free_intervals"]
+            if self._num_free_from_intervals(free_intervals) < n:
                 raise ValueError(
                     f"Cannot get {n} free blocks from shared allocator")
-            picked = free_blocks[:n]
-            del free_blocks[:n]
+            picked = self._take_from_intervals(free_intervals, n)
             refcnt: dict[int, int] = state["refcnt"]
             for bid in picked:
                 refcnt[int(bid)] = int(refcnt.get(int(bid), 0)) + 1
@@ -144,13 +267,12 @@ class _SharedBlockAllocator:
                 req_blocks_map[req_key] = req_blocks
             if len(req_blocks) < e:
                 need = e - len(req_blocks)
-                free_blocks: list[int] = state["free_blocks"]
-                if len(free_blocks) < need:
+                free_intervals: list[list[int]] = state["free_intervals"]
+                if self._num_free_from_intervals(free_intervals) < need:
                     raise ValueError(
                         f"Cannot get {need} free blocks from shared allocator"
                     )
-                picked = free_blocks[:need]
-                del free_blocks[:need]
+                picked = self._take_from_intervals(free_intervals, need)
                 req_blocks.extend(int(x) for x in picked)
             out = [int(x) for x in req_blocks[s:e]]
             refcnt: dict[int, int] = state["refcnt"]
@@ -167,13 +289,12 @@ class _SharedBlockAllocator:
         want = [int(x) for x in block_ids]
 
         def _op(state: dict[str, Any]) -> None:
-            free_blocks: list[int] = state["free_blocks"]
-            free_set = set(int(x) for x in free_blocks)
+            free_intervals: list[list[int]] = state["free_intervals"]
             refcnt: dict[int, int] = state["refcnt"]
+            removed = set(self._remove_specific_from_intervals(
+                free_intervals, want))
             for bid in want:
-                if bid in free_set:
-                    free_blocks.remove(bid)
-                    free_set.remove(bid)
+                if bid in removed:
                     refcnt[bid] = 1
                 else:
                     refcnt[bid] = int(refcnt.get(bid, 0)) + 1
@@ -189,14 +310,16 @@ class _SharedBlockAllocator:
 
         def _op(state: dict[str, Any]) -> None:
             refcnt: dict[int, int] = state["refcnt"]
-            free_blocks: list[int] = state["free_blocks"]
+            to_free: list[int] = []
             for bid in free_ids:
                 cur = int(refcnt.get(bid, 0))
                 if cur <= 1:
                     refcnt.pop(bid, None)
-                    free_blocks.append(bid)
+                    to_free.append(bid)
                 else:
                     refcnt[bid] = cur - 1
+            if to_free:
+                self._add_ids_to_intervals(state["free_intervals"], to_free)
             return None
 
         self._with_lock(_op)
@@ -212,31 +335,36 @@ class _SharedBlockAllocator:
 
         def _op(state: dict[str, Any]) -> None:
             refcnt: dict[int, int] = state["refcnt"]
-            free_blocks: list[int] = state["free_blocks"]
+            free_intervals: list[list[int]] = state["free_intervals"]
             req_blocks_map: dict[str, list[int]] = state["req_blocks"]
+            to_free: list[int] = []
             for bid in free_ids:
                 cur = int(refcnt.get(bid, 0))
                 if cur <= 1:
                     refcnt.pop(bid, None)
+                    to_free.append(bid)
                 else:
                     refcnt[bid] = cur - 1
+            if to_free:
+                self._add_ids_to_intervals(free_intervals, to_free)
 
             if terminal:
                 reserved = req_blocks_map.pop(req_key, [])
                 if reserved:
-                    free_set = set(int(x) for x in free_blocks)
+                    reclaimed: list[int] = []
                     for bid in reserved:
                         b = int(bid)
-                        if int(refcnt.get(b, 0)) == 0 and b not in free_set:
-                            free_blocks.append(b)
-                            free_set.add(b)
+                        if int(refcnt.get(b, 0)) == 0:
+                            reclaimed.append(b)
+                    if reclaimed:
+                        self._add_ids_to_intervals(free_intervals, reclaimed)
             return None
 
         self._with_lock(_op)
 
     def num_free_blocks(self) -> int:
         def _op(state: dict[str, Any]) -> int:
-            return int(len(state["free_blocks"]))
+            return self._num_free_from_intervals(state["free_intervals"])
 
         return int(self._with_lock(_op))
 
@@ -486,12 +614,24 @@ class BlockPool:
         new_hashes: Optional[list[ExternalBlockHash]] = (
             [] if self.enable_kv_cache_events else None)
         for i, blk in enumerate(new_full_blocks):
-            assert blk.block_hash is None
             block_hash = new_block_hashes[i]
-
-            # Update and added the full block to the cache.
             block_hash_with_group_id = make_block_hash_with_group_id(
                 block_hash, kv_cache_group_id)
+
+            # In shared-allocator / cross-process handoff mode, local block
+            # metadata can be stale (block already carries an old hash).
+            # Make cache insertion idempotent by evicting/resetting first.
+            if blk.block_hash is not None:
+                # Fast path: same hash already set (can happen when a block is
+                # revisited across hops). Keep it and skip reinsertion.
+                if blk.block_hash == block_hash_with_group_id:
+                    continue
+                self._maybe_evict_cached_block(blk)
+                # Fallback hard reset if local map miss prevented eviction.
+                if blk.block_hash is not None:
+                    blk.reset_hash()
+
+            # Update and added the full block to the cache.
             blk.block_hash = block_hash_with_group_id
             self.cached_block_hash_to_block.insert(block_hash_with_group_id,
                                                    blk)
@@ -542,7 +682,7 @@ class BlockPool:
                         f"referenced locally: block_id={bid}, ref_cnt={block.ref_cnt}"
                     )
                 if not block.is_null:
-                    self.free_block_queue.remove(block)
+                    self._remove_from_local_free_queue_if_present(block)
                 ret.append(block)
         else:
             if num_blocks > self.get_num_free_blocks():
@@ -573,7 +713,7 @@ class BlockPool:
             block = self.blocks[bid]
             # If this process has it in local free queue, remove it before use.
             if block.ref_cnt == 0 and not block.is_null:
-                self.free_block_queue.remove(block)
+                self._remove_from_local_free_queue_if_present(block)
             ret.append(block)
 
         if self.enable_caching:
@@ -584,6 +724,19 @@ class BlockPool:
             for block in ret:
                 block.ref_cnt += 1
         return ret
+
+    def _remove_from_local_free_queue_if_present(self,
+                                                 block: KVCacheBlock) -> None:
+        # In shared-allocator mode, a globally-free block may not be linked in
+        # this process's local free queue (stale/local-only list). Remove only
+        # when this node is actually linked to avoid RuntimeError.
+        if block.prev_free_block is None or block.next_free_block is None:
+            return
+        try:
+            self.free_block_queue.remove(block)
+        except RuntimeError:
+            # Best-effort safety for concurrent/stale local queue states.
+            return
 
     def _maybe_evict_cached_block(self, block: KVCacheBlock) -> bool:
         """
@@ -604,7 +757,13 @@ class BlockPool:
         if self.cached_block_hash_to_block.pop(block_hash,
                                                block.block_id) is None:
             # block not found in cached_block_hash_to_block,
-            # eviction is not needed
+            # eviction is not needed in single-process mode.
+            # In shared-allocator mode, block metadata may originate from
+            # another process and local cache map can miss this block id.
+            # We must still clear stale hash before re-allocation.
+            if self._shared_allocator is not None:
+                block.reset_hash()
+                return True
             return False
 
         block.reset_hash()

@@ -56,6 +56,9 @@ class EvalResult:
     gt_answer: str
     question: str
     output_text: str
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
     error: str = ""
 
 
@@ -98,6 +101,10 @@ async def one_request(
             )
         obj = r.json()
         text = obj.get("choices", [{}])[0].get("text", "")
+        usage = obj.get("usage", {}) if isinstance(obj, dict) else {}
+        prompt_tokens = int(usage.get("prompt_tokens", 0) or 0)
+        completion_tokens = int(usage.get("completion_tokens", 0) or 0)
+        total_tokens = int(usage.get("total_tokens", 0) or 0)
         pred = extract_boxed_answer(text)
         exact = bool(pred) and normalize_answer(pred) == normalize_answer(gt)
         return EvalResult(
@@ -111,6 +118,9 @@ async def one_request(
             gt_answer=gt,
             question=str(row.get("question", "")),
             output_text=text,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=total_tokens,
         )
     except Exception as e:
         return EvalResult(
@@ -124,6 +134,9 @@ async def one_request(
             gt_answer=gt,
             question=str(row.get("question", "")),
             output_text="",
+            prompt_tokens=0,
+            completion_tokens=0,
+            total_tokens=0,
             error=repr(e),
         )
 
@@ -146,6 +159,7 @@ async def run_eval(args: argparse.Namespace) -> int:
     timeout = httpx.Timeout(args.timeout_s, connect=min(30.0, args.timeout_s))
     limits = httpx.Limits(max_connections=max(100, args.concurrency * 2))
     sem = asyncio.Semaphore(args.concurrency)
+    t_run0 = time.time()
     async with httpx.AsyncClient(timeout=timeout, limits=limits) as client:
         async def wrapped(i: int, row: dict[str, Any]) -> EvalResult:
             async with sem:
@@ -161,10 +175,14 @@ async def run_eval(args: argparse.Namespace) -> int:
 
         tasks = [wrapped(i, row) for i, row in enumerate(rows)]
         results = await asyncio.gather(*tasks)
+    run_elapsed_s = time.time() - t_run0
 
     ok = [r for r in results if r.ok]
     fail = [r for r in results if not r.ok]
     exact = [r for r in ok if r.exact_match]
+    sum_prompt_tokens = sum(r.prompt_tokens for r in ok)
+    sum_completion_tokens = sum(r.completion_tokens for r in ok)
+    sum_total_tokens = sum(r.total_tokens for r in ok)
     avg_latency = sum(r.latency_s for r in results) / max(len(results), 1)
     p95_latency = sorted(r.latency_s for r in results)[int(0.95 * (len(results) - 1))]
 
@@ -181,6 +199,13 @@ async def run_eval(args: argparse.Namespace) -> int:
         "exact_match_rate": len(exact) / max(len(ok), 1),
         "avg_latency_s": avg_latency,
         "p95_latency_s": p95_latency,
+        "run_elapsed_s": run_elapsed_s,
+        "sum_prompt_tokens": sum_prompt_tokens,
+        "sum_completion_tokens": sum_completion_tokens,
+        "sum_total_tokens": sum_total_tokens,
+        "decode_tok_per_s": (
+            sum_completion_tokens / run_elapsed_s if run_elapsed_s > 0 else 0.0
+        ),
         "sample_failures": [
             {"request_id": r.request_id, "status_code": r.status_code, "error": r.error}
             for r in fail[:5]
@@ -201,6 +226,8 @@ async def run_eval(args: argparse.Namespace) -> int:
                 "pred_answer": r.pred_answer,
                 "gt_answer": r.gt_answer,
                 "text_len": r.text_len,
+                "prompt_tokens": r.prompt_tokens,
+                "completion_tokens": r.completion_tokens,
                 "output_text": r.output_text[:args.sample_text_max_chars],
             }
             for r in results[:5]
