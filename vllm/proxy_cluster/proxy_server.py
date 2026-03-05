@@ -569,17 +569,18 @@ async def _handle_completion_sequential_handoff(
             next_target,
             next_kv_port,
         )
-        if not await kv_owner_acquire(base_request_id, target_base, hop_idx):
-            if cfg.kv_owner_state_strict:
-                return JSONResponse(
-                    status_code=502,
-                    content={
-                        "error": "kv_owner_acquire_failed",
-                        "upstream": target_base,
-                        "hop": hop_idx,
-                        "decode_idx": decode_idx,
-                    },
-                )
+        if hop_idx > 1:
+            if not await kv_owner_acquire(base_request_id, target_base, hop_idx):
+                if cfg.kv_owner_state_strict:
+                    return JSONResponse(
+                        status_code=502,
+                        content={
+                            "error": "kv_owner_acquire_failed",
+                            "upstream": target_base,
+                            "hop": hop_idx,
+                            "decode_idx": decode_idx,
+                        },
+                    )
         if cfg.verbose_log:
             print(
                 f"[proxy:{cfg.role}] handoff decode_idx={decode_idx} "
@@ -673,18 +674,19 @@ async def _handle_completion_sequential_handoff(
         usage_obj = resp_obj.get("usage") or {}
         hop_completion_tokens = int(usage_obj.get("completion_tokens", 0)) \
             if isinstance(usage_obj.get("completion_tokens"), int) else 0
-        if not await kv_owner_commit(base_request_id, target_base, hop_idx,
-                                     hop_completion_tokens):
-            if cfg.kv_owner_state_strict:
-                return JSONResponse(
-                    status_code=502,
-                    content={
-                        "error": "kv_owner_commit_failed",
-                        "upstream": target_base,
-                        "hop": hop_idx,
-                        "decode_idx": decode_idx,
-                    },
-                )
+        if hop_idx > 1:
+            if not await kv_owner_commit(base_request_id, target_base, hop_idx,
+                                         hop_completion_tokens):
+                if cfg.kv_owner_state_strict:
+                    return JSONResponse(
+                        status_code=502,
+                        content={
+                            "error": "kv_owner_commit_failed",
+                            "upstream": target_base,
+                            "hop": hop_idx,
+                            "decode_idx": decode_idx,
+                        },
+                    )
         next_kv_transfer_params = resp_obj.get("kv_transfer_params")
         if not is_last_hop and cfg.require_kv_transfer and not isinstance(next_kv_transfer_params, dict):
             return JSONResponse(
@@ -720,7 +722,8 @@ async def _handle_completion_sequential_handoff(
             break
 
     assert last_resp is not None
-    await kv_owner_release(base_request_id, plan[-1][0], len(plan))
+    if len(plan) > 1:
+        await kv_owner_release(base_request_id, plan[-1][0], len(plan))
     if "choices" in last_resp and isinstance(last_resp["choices"], list) and last_resp["choices"]:
         last_resp["choices"][0]["text"] = generated_text
     usage = last_resp.get("usage")

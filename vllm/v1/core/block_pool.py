@@ -249,6 +249,11 @@ class _SharedBlockAllocator:
         # In our handoff format, only non-last hops carry decode addr.
         return "___decode_addr_" not in rid
 
+    @staticmethod
+    def is_post_cutover_request_id(request_id: str) -> bool:
+        # Post-cutover hops carry prefill_addr marker from previous server.
+        return "___prefill_addr_" in str(request_id)
+
     def allocate_request_range(self, request_id: str, start: int,
                                end: int) -> list[int]:
         s = int(start)
@@ -702,10 +707,33 @@ class BlockPool:
                 block.ref_cnt += 1
         return ret
 
+    def _get_new_blocks_local(self, num_blocks: int) -> list[KVCacheBlock]:
+        if num_blocks > self.free_block_queue.num_free_blocks:
+            raise ValueError(f"Cannot get {num_blocks} free blocks from the pool")
+        ret = self.free_block_queue.popleft_n(num_blocks)
+        if self.enable_caching:
+            for block in ret:
+                self._maybe_evict_cached_block(block)
+                assert block.ref_cnt == 0
+                block.ref_cnt += 1
+        else:
+            for block in ret:
+                assert block.ref_cnt == 0
+                block.ref_cnt += 1
+        return ret
+
+    def _use_shared_for_request(self, request_id: Optional[str]) -> bool:
+        if self._shared_allocator is None:
+            return False
+        if not request_id:
+            return False
+        return self._shared_allocator.is_post_cutover_request_id(request_id)
+
     def get_new_blocks_for_request(self, request_id: str, start: int,
                                    end: int) -> list[KVCacheBlock]:
-        if self._shared_allocator is None:
-            return self.get_new_blocks(max(0, int(end) - int(start)))
+        num = max(0, int(end) - int(start))
+        if not self._use_shared_for_request(request_id):
+            return self._get_new_blocks_local(num)
         block_ids = self._shared_allocator.allocate_request_range(
             request_id, int(start), int(end))
         ret: list[KVCacheBlock] = []
@@ -817,7 +845,8 @@ class BlockPool:
             if block.ref_cnt == 0 and not block.is_null
         ]
         self.free_block_queue.append_n(released_blocks)
-        if self._shared_allocator is not None and released_blocks:
+        if self._shared_allocator is not None and released_blocks and \
+                self._use_shared_for_request(request_id):
             block_ids = [block.block_id for block in released_blocks]
             if request_id:
                 self._shared_allocator.release_request_blocks(
@@ -871,6 +900,21 @@ class BlockPool:
             return self._shared_allocator.num_free_blocks()
         except Exception:
             return self.free_block_queue.num_free_blocks
+
+    def get_num_free_blocks_for_request(self, request_id: Optional[str]) -> int:
+        """Request-aware free block count for tiered allocator mode.
+
+        - pre-cutover/local requests: use local free queue only
+        - post-cutover/shared requests: use shared allocator view
+        """
+        if not self._use_shared_for_request(request_id):
+            return int(self.free_block_queue.num_free_blocks)
+        try:
+            return int(self._shared_allocator.num_free_blocks()
+                       ) if self._shared_allocator is not None else int(
+                           self.free_block_queue.num_free_blocks)
+        except Exception:
+            return int(self.free_block_queue.num_free_blocks)
 
     def get_usage(self) -> float:
         """Get the KV cache usage.
