@@ -1,5 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import fcntl
+import os
+import pickle
+import re
 from collections.abc import Iterable
 from typing import Any, Optional, Union
 
@@ -16,6 +20,225 @@ from vllm.v1.core.kv_cache_utils import (BlockHash, BlockHashWithGroupId,
 from vllm.v1.request import Request
 
 logger = init_logger(__name__)
+
+
+class _SharedBlockAllocator:
+    """Process-shared block allocator (experimental).
+
+    This allocator provides a global view of free/used KV blocks across
+    multiple server processes that map the same shared KV pool.
+    """
+
+    def __init__(self, path: str, key: str, num_gpu_blocks: int, reset: bool):
+        self._num_gpu_blocks = int(num_gpu_blocks)
+        base = f"{path}.{key}"
+        self._state_path = f"{base}.pkl"
+        self._lock_path = f"{base}.lock"
+        if reset:
+            self._initialize_state()
+        else:
+            # Best effort lazy init for first process that comes up.
+            if not os.path.exists(self._state_path):
+                self._initialize_state()
+
+    def _initialize_state(self) -> None:
+        state = {
+            "num_gpu_blocks": self._num_gpu_blocks,
+            # Keep block 0 reserved as null block.
+            "free_blocks": list(range(1, self._num_gpu_blocks)),
+            "refcnt": {},
+            # canonical_request_id -> ordered block ids (global block table)
+            "req_blocks": {},
+        }
+        os.makedirs(os.path.dirname(self._state_path) or ".", exist_ok=True)
+        with open(self._lock_path, "a+b"):
+            pass
+        with open(self._state_path, "wb") as f:
+            pickle.dump(state, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+    def _load_state(self) -> dict[str, Any]:
+        if not os.path.exists(self._state_path):
+            self._initialize_state()
+        with open(self._state_path, "rb") as f:
+            state = pickle.load(f)
+        if not isinstance(state, dict):
+            raise RuntimeError("shared allocator state is invalid")
+        if int(state.get("num_gpu_blocks", -1)) != self._num_gpu_blocks:
+            raise RuntimeError(
+                "shared allocator num_gpu_blocks mismatch: "
+                f"{state.get('num_gpu_blocks')} vs {self._num_gpu_blocks}")
+        state.setdefault("free_blocks", [])
+        state.setdefault("refcnt", {})
+        state.setdefault("req_blocks", {})
+        return state
+
+    def _save_state(self, state: dict[str, Any]) -> None:
+        tmp = f"{self._state_path}.tmp.{os.getpid()}"
+        with open(tmp, "wb") as f:
+            pickle.dump(state, f, protocol=pickle.HIGHEST_PROTOCOL)
+        os.replace(tmp, self._state_path)
+
+    def _with_lock(self, fn):
+        with open(self._lock_path, "a+b") as lf:
+            fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
+            try:
+                state = self._load_state()
+                out = fn(state)
+                self._save_state(state)
+                return out
+            finally:
+                fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
+
+    def allocate(self, num_blocks: int) -> list[int]:
+        n = int(num_blocks)
+        if n <= 0:
+            return []
+
+        def _op(state: dict[str, Any]) -> list[int]:
+            free_blocks: list[int] = state["free_blocks"]
+            if len(free_blocks) < n:
+                raise ValueError(
+                    f"Cannot get {n} free blocks from shared allocator")
+            picked = free_blocks[:n]
+            del free_blocks[:n]
+            refcnt: dict[int, int] = state["refcnt"]
+            for bid in picked:
+                refcnt[int(bid)] = int(refcnt.get(int(bid), 0)) + 1
+            return [int(x) for x in picked]
+
+        return self._with_lock(_op)
+
+    @staticmethod
+    def canonical_request_id(request_id: str) -> str:
+        rid = str(request_id)
+        if rid.startswith("cmpl-"):
+            rid = rid[len("cmpl-"):]
+        had_marker = ("___prefill_addr_" in rid) or ("___decode_addr_" in rid)
+        rid = rid.split("___prefill_addr_")[0].split("___decode_addr_")[0]
+        # vLLM may append worker suffix like "-0" for the same logical req.
+        if had_marker:
+            rid = re.sub(r"-\d+$", "", rid)
+        return rid
+
+    @staticmethod
+    def is_terminal_request_id(request_id: str) -> bool:
+        rid = str(request_id)
+        # In our handoff format, only non-last hops carry decode addr.
+        return "___decode_addr_" not in rid
+
+    def allocate_request_range(self, request_id: str, start: int,
+                               end: int) -> list[int]:
+        s = int(start)
+        e = int(end)
+        if e <= s:
+            return []
+        if s < 0:
+            raise ValueError(f"invalid request range start={s}")
+        req_key = self.canonical_request_id(request_id)
+
+        def _op(state: dict[str, Any]) -> list[int]:
+            req_blocks_map: dict[str, list[int]] = state["req_blocks"]
+            req_blocks = req_blocks_map.get(req_key)
+            if req_blocks is None:
+                req_blocks = []
+                req_blocks_map[req_key] = req_blocks
+            if len(req_blocks) < e:
+                need = e - len(req_blocks)
+                free_blocks: list[int] = state["free_blocks"]
+                if len(free_blocks) < need:
+                    raise ValueError(
+                        f"Cannot get {need} free blocks from shared allocator"
+                    )
+                picked = free_blocks[:need]
+                del free_blocks[:need]
+                req_blocks.extend(int(x) for x in picked)
+            out = [int(x) for x in req_blocks[s:e]]
+            refcnt: dict[int, int] = state["refcnt"]
+            for bid in out:
+                refcnt[bid] = int(refcnt.get(bid, 0)) + 1
+            return out
+
+        return self._with_lock(_op)
+
+    def reserve_specific(self, block_ids: list[int]) -> None:
+        if not block_ids:
+            return
+
+        want = [int(x) for x in block_ids]
+
+        def _op(state: dict[str, Any]) -> None:
+            free_blocks: list[int] = state["free_blocks"]
+            free_set = set(int(x) for x in free_blocks)
+            refcnt: dict[int, int] = state["refcnt"]
+            for bid in want:
+                if bid in free_set:
+                    free_blocks.remove(bid)
+                    free_set.remove(bid)
+                    refcnt[bid] = 1
+                else:
+                    refcnt[bid] = int(refcnt.get(bid, 0)) + 1
+            return None
+
+        self._with_lock(_op)
+
+    def release(self, block_ids: list[int]) -> None:
+        if not block_ids:
+            return
+
+        free_ids = [int(x) for x in block_ids if int(x) > 0]
+
+        def _op(state: dict[str, Any]) -> None:
+            refcnt: dict[int, int] = state["refcnt"]
+            free_blocks: list[int] = state["free_blocks"]
+            for bid in free_ids:
+                cur = int(refcnt.get(bid, 0))
+                if cur <= 1:
+                    refcnt.pop(bid, None)
+                    free_blocks.append(bid)
+                else:
+                    refcnt[bid] = cur - 1
+            return None
+
+        self._with_lock(_op)
+
+    def release_request_blocks(self,
+                               request_id: str,
+                               block_ids: list[int],
+                               terminal: bool = False) -> None:
+        if not block_ids and not terminal:
+            return
+        req_key = self.canonical_request_id(request_id)
+        free_ids = [int(x) for x in block_ids if int(x) > 0]
+
+        def _op(state: dict[str, Any]) -> None:
+            refcnt: dict[int, int] = state["refcnt"]
+            free_blocks: list[int] = state["free_blocks"]
+            req_blocks_map: dict[str, list[int]] = state["req_blocks"]
+            for bid in free_ids:
+                cur = int(refcnt.get(bid, 0))
+                if cur <= 1:
+                    refcnt.pop(bid, None)
+                else:
+                    refcnt[bid] = cur - 1
+
+            if terminal:
+                reserved = req_blocks_map.pop(req_key, [])
+                if reserved:
+                    free_set = set(int(x) for x in free_blocks)
+                    for bid in reserved:
+                        b = int(bid)
+                        if int(refcnt.get(b, 0)) == 0 and b not in free_set:
+                            free_blocks.append(b)
+                            free_set.add(b)
+            return None
+
+        self._with_lock(_op)
+
+    def num_free_blocks(self) -> int:
+        def _op(state: dict[str, Any]) -> int:
+            return int(len(state["free_blocks"]))
+
+        return int(self._with_lock(_op))
 
 
 class BlockHashToBlockMap:
@@ -160,6 +383,49 @@ class BlockPool:
         self.enable_kv_cache_events = enable_kv_cache_events
         self.kv_event_queue: list[KVCacheEvent] = []
 
+        self._shared_allocator: Optional[_SharedBlockAllocator] = None
+        shared_enable = os.getenv("VLLM_SHARED_BLOCK_ALLOCATOR_ENABLE",
+                                  "").strip().lower() in {
+                                      "1", "true", "yes", "on"
+                                  }
+        if shared_enable:
+            # Keep key stable for processes that target the same physical GPU.
+            key = os.getenv("VLLM_SHARED_BLOCK_ALLOCATOR_KEY", "").strip()
+            if not key:
+                cvd = os.getenv("CUDA_VISIBLE_DEVICES", "all")
+                key = f"{cvd}__lr{os.getenv('LOCAL_RANK', '0')}"
+                # Prefer runtime CUDA device identity when available.
+                try:
+                    import torch  # local import to avoid hard dependency here
+                    if torch.cuda.is_available():
+                        local_idx = int(torch.cuda.current_device())
+                        phys = str(local_idx)
+                        if cvd and cvd != "all":
+                            parts = [x.strip() for x in cvd.split(",")]
+                            if 0 <= local_idx < len(parts):
+                                phys = parts[local_idx]
+                        key = f"gpu{phys}"
+                except Exception:
+                    pass
+            path = os.getenv("VLLM_SHARED_BLOCK_ALLOCATOR_PATH",
+                             "/tmp/vllm_shared_block_allocator").strip()
+            reset = os.getenv("VLLM_SHARED_BLOCK_ALLOCATOR_RESET",
+                              "").strip().lower() in {"1", "true", "yes", "on"}
+            try:
+                self._shared_allocator = _SharedBlockAllocator(
+                    path=path,
+                    key=key,
+                    num_gpu_blocks=num_gpu_blocks,
+                    reset=reset,
+                )
+                logger.info("shared block allocator enabled key=%s path=%s",
+                            key, path)
+            except Exception as e:
+                logger.warning(
+                    "failed to enable shared block allocator, fallback to local pool: %s",
+                    repr(e))
+                self._shared_allocator = None
+
     def get_cached_block(
             self, block_hash: BlockHash,
             kv_cache_group_ids: list[int]) -> Optional[list[KVCacheBlock]]:
@@ -265,11 +531,24 @@ class BlockPool:
         Returns:
             A list of new block.
         """
-        if num_blocks > self.get_num_free_blocks():
-            raise ValueError(
-                f"Cannot get {num_blocks} free blocks from the pool")
-
-        ret: list[KVCacheBlock] = self.free_block_queue.popleft_n(num_blocks)
+        if self._shared_allocator is not None:
+            block_ids = self._shared_allocator.allocate(num_blocks)
+            ret: list[KVCacheBlock] = []
+            for bid in block_ids:
+                block = self.blocks[bid]
+                if block.ref_cnt != 0:
+                    raise RuntimeError(
+                        "shared allocator selected a block that is still "
+                        f"referenced locally: block_id={bid}, ref_cnt={block.ref_cnt}"
+                    )
+                if not block.is_null:
+                    self.free_block_queue.remove(block)
+                ret.append(block)
+        else:
+            if num_blocks > self.get_num_free_blocks():
+                raise ValueError(
+                    f"Cannot get {num_blocks} free blocks from the pool")
+            ret = self.free_block_queue.popleft_n(num_blocks)
 
         # In order to only iterate the list once, we duplicated code a bit
         if self.enable_caching:
@@ -280,6 +559,29 @@ class BlockPool:
         else:
             for block in ret:
                 assert block.ref_cnt == 0
+                block.ref_cnt += 1
+        return ret
+
+    def get_new_blocks_for_request(self, request_id: str, start: int,
+                                   end: int) -> list[KVCacheBlock]:
+        if self._shared_allocator is None:
+            return self.get_new_blocks(max(0, int(end) - int(start)))
+        block_ids = self._shared_allocator.allocate_request_range(
+            request_id, int(start), int(end))
+        ret: list[KVCacheBlock] = []
+        for bid in block_ids:
+            block = self.blocks[bid]
+            # If this process has it in local free queue, remove it before use.
+            if block.ref_cnt == 0 and not block.is_null:
+                self.free_block_queue.remove(block)
+            ret.append(block)
+
+        if self.enable_caching:
+            for block in ret:
+                self._maybe_evict_cached_block(block)
+                block.ref_cnt += 1
+        else:
+            for block in ret:
                 block.ref_cnt += 1
         return ret
 
@@ -332,10 +634,14 @@ class BlockPool:
                 # ref_cnt=0 means this block is in the free list (i.e. eviction
                 # candidate), so remove it.
                 if block.ref_cnt == 0 and not block.is_null:
+                    if self._shared_allocator is not None:
+                        self._shared_allocator.reserve_specific([block.block_id])
                     self.free_block_queue.remove(block)
                 block.ref_cnt += 1
 
-    def free_blocks(self, ordered_blocks: Iterable[KVCacheBlock]) -> None:
+    def free_blocks(self,
+                    ordered_blocks: Iterable[KVCacheBlock],
+                    request_id: Optional[str] = None) -> None:
         """Free a list of blocks. The blocks should be ordered by their
         eviction priority, where the first block will be evicted first.
 
@@ -347,10 +653,22 @@ class BlockPool:
         blocks_list = list(ordered_blocks)
         for block in blocks_list:
             block.ref_cnt -= 1
-        self.free_block_queue.append_n([
+        released_blocks = [
             block for block in blocks_list
             if block.ref_cnt == 0 and not block.is_null
-        ])
+        ]
+        self.free_block_queue.append_n(released_blocks)
+        if self._shared_allocator is not None and released_blocks:
+            block_ids = [block.block_id for block in released_blocks]
+            if request_id:
+                self._shared_allocator.release_request_blocks(
+                    request_id=request_id,
+                    block_ids=block_ids,
+                    terminal=self._shared_allocator.is_terminal_request_id(
+                        request_id),
+                )
+            else:
+                self._shared_allocator.release(block_ids)
 
     def reset_prefix_cache(self) -> bool:
         """Reset prefix cache. This function may be used in RLHF
@@ -388,7 +706,12 @@ class BlockPool:
         Returns:
             The number of free blocks.
         """
-        return self.free_block_queue.num_free_blocks
+        if self._shared_allocator is None:
+            return self.free_block_queue.num_free_blocks
+        try:
+            return self._shared_allocator.num_free_blocks()
+        except Exception:
+            return self.free_block_queue.num_free_blocks
 
     def get_usage(self) -> float:
         """Get the KV cache usage.

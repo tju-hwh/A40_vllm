@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
+import time
 import uuid
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
@@ -39,6 +41,12 @@ class ProxyConfig:
     connect_timeout_s: float
     verbose_log: bool
     require_kv_transfer: bool
+    dynamic_kv_control_path: str
+    dynamic_kv_wait_timeout_s: float
+    dynamic_kv_settle_s: float
+    kv_owner_state_url: str
+    kv_owner_state_strict: bool
+    max_response_length: int
 
     @staticmethod
     def from_env() -> "ProxyConfig":
@@ -107,6 +115,12 @@ class ProxyConfig:
             connect_timeout_s=float(os.getenv("CONNECT_TIMEOUT_S", "30")),
             verbose_log=_parse_bool(os.getenv("PROXY_VERBOSE_LOG"), default=False),
             require_kv_transfer=_parse_bool(os.getenv("REQUIRE_KV_TRANSFER"), default=False),
+            dynamic_kv_control_path=os.getenv("DYNAMIC_KV_CONTROL_PATH", "").strip(),
+            dynamic_kv_wait_timeout_s=float(os.getenv("DYNAMIC_KV_WAIT_TIMEOUT_S", "120")),
+            dynamic_kv_settle_s=float(os.getenv("DYNAMIC_KV_SETTLE_S", "2.0")),
+            kv_owner_state_url=os.getenv("KV_OWNER_STATE_URL", "").strip(),
+            kv_owner_state_strict=_parse_bool(os.getenv("KV_OWNER_STATE_STRICT"), default=False),
+            max_response_length=max(1, int(os.getenv("MAX_RESPONSE_LENGTH", "4096"))),
         )
 
 
@@ -228,6 +242,127 @@ def _build_p2p_request_id(base_request_id: str, prev_target: str | None,
     return rid
 
 
+def _merge_hop_text(existing: str, new: str, max_window: int = 4096) -> str:
+    """Append hop text while removing longest suffix/prefix overlap."""
+    if not existing:
+        return new
+    if not new:
+        return existing
+    # If upstream returns cumulative text for this request, keep the longest.
+    if new.startswith(existing):
+        return new
+    if existing.startswith(new):
+        return existing
+    # If next hop restarts from an earlier prefix, trim the duplicated prefix
+    # from new by finding the longest new-prefix already present in existing.
+    max_k_anywhere = min(len(new), max_window)
+    for k in range(max_k_anywhere, 31, -1):
+        if new[:k] in existing:
+            return existing + new[k:]
+    max_k = min(len(existing), len(new), max_window)
+    for k in range(max_k, 0, -1):
+        if existing[-k:] == new[:k]:
+            return existing + new[k:]
+    return existing + new
+
+
+def _is_cumulative_hop_text(existing: str, new: str) -> bool:
+    if not existing or not new:
+        return False
+    if new.startswith(existing):
+        return True
+    # Heuristic: if new already contains the head of existing near start and
+    # has comparable/greater length, it is likely cumulative text.
+    head = existing[:min(64, len(existing))]
+    pos = new.find(head)
+    if pos != -1 and pos <= 96 and len(new) + 32 >= len(existing):
+        return True
+    return False
+
+
+def _collapse_immediate_repeats(text: str,
+                                min_chunk: int = 8,
+                                max_chunk: int = 192) -> str:
+    """Remove immediate duplicated chunks introduced at hop boundaries."""
+    n = len(text)
+    if n < min_chunk * 2:
+        return text
+    out: list[str] = []
+    i = 0
+    while i < n:
+        matched = False
+        max_l = min(max_chunk, (n - i) // 2)
+        for l in range(max_l, min_chunk - 1, -1):
+            a = text[i:i + l]
+            b = text[i + l:i + 2 * l]
+            if a == b:
+                out.append(a)
+                i += 2 * l
+                while i + l <= n and text[i:i + l] == a:
+                    i += l
+                matched = True
+                break
+        if not matched:
+            out.append(text[i])
+            i += 1
+    return "".join(out)
+
+
+def _dedup_nearby_sentences(text: str, window: int = 4) -> str:
+    """Drop repeated nearby sentences while preserving order."""
+    parts = re.split(r"([.!?\n]+)", text)
+    if len(parts) <= 2:
+        return text
+    out: list[str] = []
+    recent: list[str] = []
+    i = 0
+    while i < len(parts):
+        sent = parts[i]
+        sep = parts[i + 1] if i + 1 < len(parts) else ""
+        norm = sent.strip().lower()
+        if norm and len(norm) >= 12:
+            if norm in recent[-window:]:
+                i += 2
+                continue
+            recent.append(norm)
+        out.append(sent)
+        out.append(sep)
+        i += 2
+    return "".join(out)
+
+
+def _write_dynamic_kv_control(path: str, active_upstream: str | None) -> None:
+    if not path:
+        return
+    payload = {
+        "active_upstream": active_upstream,
+        "updated_at": time.time(),
+    }
+    tmp = f"{path}.tmp.{os.getpid()}"
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(payload, f, separators=(",", ":"))
+    os.replace(tmp, path)
+
+
+async def _wait_upstream_ready(
+    client: httpx.AsyncClient,
+    upstream: str,
+    timeout_s: float,
+) -> bool:
+    deadline = time.time() + timeout_s
+    url = upstream.rstrip("/") + "/v1/models"
+    while time.time() < deadline:
+        try:
+            resp = await client.get(url)
+            if 200 <= resp.status_code < 300:
+                return True
+        except Exception:
+            pass
+        await asyncio.sleep(0.25)
+    return False
+
+
 async def _handle_completion_sequential_handoff(
     *,
     client: httpx.AsyncClient,
@@ -239,6 +374,60 @@ async def _handle_completion_sequential_handoff(
     query: str,
     decode_idx: Optional[int],
 ) -> Response:
+    async def kv_owner_acquire(req_id: str, worker: str, hop: int) -> bool:
+        if not cfg.kv_owner_state_url:
+            return True
+        try:
+            resp = await client.post(
+                cfg.kv_owner_state_url.rstrip("/") + "/acquire",
+                json={"request_id": req_id, "worker": worker, "hop": hop},
+            )
+            return 200 <= resp.status_code < 300 and bool(resp.json().get("ok", False))
+        except Exception:
+            return False
+
+    async def kv_owner_commit(req_id: str, worker: str, hop: int,
+                              generated_tokens: int) -> bool:
+        if not cfg.kv_owner_state_url:
+            return True
+        try:
+            resp = await client.post(
+                cfg.kv_owner_state_url.rstrip("/") + "/commit",
+                json={
+                    "request_id": req_id,
+                    "worker": worker,
+                    "hop": hop,
+                    "generated_tokens": generated_tokens,
+                },
+            )
+            return 200 <= resp.status_code < 300 and bool(resp.json().get("ok", False))
+        except Exception:
+            return False
+
+    async def kv_owner_release(req_id: str, worker: str, hop: int) -> bool:
+        if not cfg.kv_owner_state_url:
+            return True
+        try:
+            resp = await client.post(
+                cfg.kv_owner_state_url.rstrip("/") + "/release",
+                json={"request_id": req_id, "worker": worker, "hop": hop},
+            )
+            return 200 <= resp.status_code < 300 and bool(resp.json().get("ok", False))
+        except Exception:
+            return False
+
+    async def kv_owner_reset(req_id: str) -> bool:
+        if not cfg.kv_owner_state_url:
+            return True
+        try:
+            resp = await client.post(
+                cfg.kv_owner_state_url.rstrip("/") + "/reset",
+                json={"request_id": req_id},
+            )
+            return 200 <= resp.status_code < 300 and bool(resp.json().get("ok", False))
+        except Exception:
+            return False
+
     try:
         req_obj = json.loads(body.decode("utf-8"))
     except Exception as exc:
@@ -257,6 +446,9 @@ async def _handle_completion_sequential_handoff(
         )
 
     total_max_tokens = int(req_obj.get("max_tokens", 16))
+    if total_max_tokens > cfg.max_response_length:
+        total_max_tokens = cfg.max_response_length
+        req_obj["max_tokens"] = total_max_tokens
     if total_max_tokens <= 0:
         return JSONResponse(status_code=400, content={"error": "max_tokens must be > 0"})
 
@@ -269,7 +461,8 @@ async def _handle_completion_sequential_handoff(
         return JSONResponse(status_code=400, content={"error": "empty handoff execution plan"})
 
     generated_text = ""
-    current_prompt = prompt
+    cumulative_prompt_token_ids: Optional[list[int]] = None
+    base_prompt = prompt
     req_kv = req_obj.get("kv_transfer_params")
     kv_transfer_params: Optional[dict[str, Any]]
     if isinstance(req_kv, dict):
@@ -283,10 +476,36 @@ async def _handle_completion_sequential_handoff(
     last_resp: dict[str, Any] | None = None
     first_id = req_obj.get("request_id")
     base_request_id = str(first_id) if first_id else f"handoff-{uuid.uuid4().hex}"
+    # Prevent state bleed when clients accidentally reuse request_id.
+    await kv_owner_reset(base_request_id)
 
     for hop_idx, (target_base, hop_max_tokens) in enumerate(plan, start=1):
         is_last_hop = hop_idx == len(plan)
         await state.add_target_hit(target_base)
+        # Dynamic KV profile switch: only consumers (server2/3/4) are toggled.
+        if cfg.dynamic_kv_control_path:
+            # Only switch dynamic KV profile when the target is a consumer.
+            # Avoid forcing "active->inactive" on every primary hop, which
+            # causes unnecessary restart churn and can destabilize consumers.
+            if target_base != cfg.primary_upstream:
+                _write_dynamic_kv_control(cfg.dynamic_kv_control_path, target_base)
+                if cfg.dynamic_kv_settle_s > 0:
+                    await asyncio.sleep(cfg.dynamic_kv_settle_s)
+                ready = await _wait_upstream_ready(
+                    client,
+                    target_base,
+                    cfg.dynamic_kv_wait_timeout_s,
+                )
+                if not ready:
+                    return JSONResponse(
+                        status_code=502,
+                        content={
+                            "error": "upstream_not_ready_after_dynamic_switch",
+                            "upstream": target_base,
+                            "hop": hop_idx,
+                            "decode_idx": decode_idx,
+                        },
+                    )
         prev_target = plan[hop_idx - 2][0] if hop_idx > 1 else None
         next_target = plan[hop_idx][0] if hop_idx < len(plan) else None
         target_index = cfg.sequential_targets.index(target_base)
@@ -295,8 +514,21 @@ async def _handle_completion_sequential_handoff(
 
         hop_req = dict(req_obj)
         hop_req["stream"] = False
-        hop_req["prompt"] = current_prompt
+        # For non-first hops, include text generated so far in prompt so the
+        # destination scheduler can account for full context length. KV handoff
+        # remains enabled and should avoid recomputing most of this context.
+        if hop_idx == 1:
+            hop_req["prompt"] = base_prompt
+        elif cumulative_prompt_token_ids:
+            # Use exact token history from previous hop to avoid text->token
+            # re-encoding drift across servers.
+            hop_req["prompt"] = cumulative_prompt_token_ids
+        else:
+            # Fallback path when upstream did not return token IDs.
+            hop_req["prompt"] = base_prompt + generated_text
         hop_req["max_tokens"] = hop_max_tokens
+        # Internal chaining requires exact token continuity across hops.
+        hop_req["return_token_ids"] = True
         # Keep a stable logical request id and embed prefill/decode addrs for
         # connectors (notably P2pNcclConnector) to resolve recv/send peers.
         hop_req["request_id"] = _build_p2p_request_id(
@@ -306,6 +538,17 @@ async def _handle_completion_sequential_handoff(
             next_target,
             next_kv_port,
         )
+        if not await kv_owner_acquire(base_request_id, target_base, hop_idx):
+            if cfg.kv_owner_state_strict:
+                return JSONResponse(
+                    status_code=502,
+                    content={
+                        "error": "kv_owner_acquire_failed",
+                        "upstream": target_base,
+                        "hop": hop_idx,
+                        "decode_idx": decode_idx,
+                    },
+                )
         if cfg.verbose_log:
             print(
                 f"[proxy:{cfg.role}] handoff decode_idx={decode_idx} "
@@ -384,8 +627,33 @@ async def _handle_completion_sequential_handoff(
                 f"hop={hop_idx}/{len(plan)} done status={resp.status_code} "
                 f"text_len={len(hop_text)}"
             )
+        # In token-id chaining mode each hop returns newly generated text.
         generated_text += hop_text
-        current_prompt += hop_text
+        choices_obj = resp_obj.get("choices")
+        if isinstance(choices_obj, list) and choices_obj:
+            ch0 = choices_obj[0] if isinstance(choices_obj[0], dict) else {}
+            p_ids = ch0.get("prompt_token_ids")
+            o_ids = ch0.get("token_ids")
+            if isinstance(o_ids, list) and all(isinstance(x, int) for x in o_ids):
+                if isinstance(p_ids, list) and all(isinstance(x, int) for x in p_ids):
+                    cumulative_prompt_token_ids = list(p_ids) + list(o_ids)
+                elif cumulative_prompt_token_ids is not None:
+                    cumulative_prompt_token_ids = cumulative_prompt_token_ids + list(o_ids)
+        usage_obj = resp_obj.get("usage") or {}
+        hop_completion_tokens = int(usage_obj.get("completion_tokens", 0)) \
+            if isinstance(usage_obj.get("completion_tokens"), int) else 0
+        if not await kv_owner_commit(base_request_id, target_base, hop_idx,
+                                     hop_completion_tokens):
+            if cfg.kv_owner_state_strict:
+                return JSONResponse(
+                    status_code=502,
+                    content={
+                        "error": "kv_owner_commit_failed",
+                        "upstream": target_base,
+                        "hop": hop_idx,
+                        "decode_idx": decode_idx,
+                    },
+                )
         next_kv_transfer_params = resp_obj.get("kv_transfer_params")
         if not is_last_hop and cfg.require_kv_transfer and not isinstance(next_kv_transfer_params, dict):
             return JSONResponse(
@@ -411,7 +679,17 @@ async def _handle_completion_sequential_handoff(
             sum_completion_tokens += int(usage_obj["completion_tokens"])
         last_resp = resp_obj
 
+        # Preserve native vLLM termination semantics: if this hop already
+        # reached a terminal finish_reason (not token-limit), stop handoff.
+        finish_reason = None
+        choices_obj = resp_obj.get("choices")
+        if isinstance(choices_obj, list) and choices_obj and isinstance(choices_obj[0], dict):
+            finish_reason = choices_obj[0].get("finish_reason")
+        if finish_reason is not None and str(finish_reason) != "length":
+            break
+
     assert last_resp is not None
+    await kv_owner_release(base_request_id, plan[-1][0], len(plan))
     if "choices" in last_resp and isinstance(last_resp["choices"], list) and last_resp["choices"]:
         last_resp["choices"][0]["text"] = generated_text
     usage = last_resp.get("usage")
@@ -464,6 +742,7 @@ def create_app() -> FastAPI:
             "decode_request_count": state.decode_request_count,
             "decode_target_counts": state.decode_target_counts,
             "post_cutover_rr_index": state.post_cutover_rr_index,
+            "max_response_length": cfg.max_response_length,
         }
 
     @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"])

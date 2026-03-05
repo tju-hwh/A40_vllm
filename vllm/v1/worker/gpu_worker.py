@@ -182,7 +182,30 @@ class Worker(WorkerBase):
             self.init_snapshot = MemorySnapshot()
             self.requested_memory = (self.init_snapshot.total_memory *
                                      self.cache_config.gpu_memory_utilization)
-            if self.init_snapshot.free_memory < self.requested_memory:
+            # In experimental shared-kv-pool consumer mode, KV tensors are
+            # imported from producer via CUDA IPC. The local startup free-memory
+            # threshold can be overly strict and block valid launches.
+            skip_free_mem_gate = False
+            kv_cfg = self.vllm_config.kv_transfer_config
+            if kv_cfg is not None:
+                try:
+                    shared_enable = bool(
+                        kv_cfg.get_from_extra_config("shared_kv_pool_enable",
+                                                     False))
+                    shared_role = str(
+                        kv_cfg.get_from_extra_config("shared_kv_pool_role",
+                                                     "")).strip().lower()
+                    is_shared_consumer = (
+                        shared_enable and
+                        (shared_role == "consumer"
+                         or (kv_cfg.is_kv_consumer and
+                             not kv_cfg.is_kv_producer)))
+                    skip_free_mem_gate = is_shared_consumer
+                except Exception:
+                    skip_free_mem_gate = False
+
+            if self.init_snapshot.free_memory < self.requested_memory and \
+                    not skip_free_mem_gate:
                 GiB = lambda b: round(b / GiB_bytes, 2)
                 raise ValueError(
                     f"Free memory on device "
@@ -192,6 +215,16 @@ class Worker(WorkerBase):
                     f"({self.cache_config.gpu_memory_utilization}, "
                     f"{GiB(self.requested_memory)} GiB). Decrease GPU memory "
                     f"utilization or reduce GPU memory used by other processes."
+                )
+            if self.init_snapshot.free_memory < self.requested_memory and \
+                    skip_free_mem_gate:
+                GiB = lambda b: round(b / GiB_bytes, 2)
+                logger.warning(
+                    "Skip startup free-memory gate in shared-kv consumer mode: "
+                    "free %.2f GiB < requested %.2f GiB (gpu_memory_utilization=%.2f)",
+                    GiB(self.init_snapshot.free_memory),
+                    GiB(self.requested_memory),
+                    self.cache_config.gpu_memory_utilization,
                 )
         else:
             raise RuntimeError(

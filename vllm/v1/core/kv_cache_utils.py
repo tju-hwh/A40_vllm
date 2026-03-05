@@ -4,6 +4,7 @@
 
 import copy
 import os
+import pickle
 from collections import defaultdict, deque
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
@@ -76,6 +77,58 @@ logger = init_logger(__name__)
 #
 # The function `init_none_hash` initializes this variable globally.
 NONE_HASH: BlockHash
+
+
+def _is_shared_kv_pool_consumer(vllm_config: VllmConfig) -> bool:
+    kv_cfg = vllm_config.kv_transfer_config
+    if kv_cfg is None:
+        return False
+    try:
+        enabled = bool(kv_cfg.get_from_extra_config("shared_kv_pool_enable",
+                                                    False))
+        role = str(kv_cfg.get_from_extra_config("shared_kv_pool_role",
+                                                "")).strip().lower()
+        return enabled and (role == "consumer"
+                            or (kv_cfg.is_kv_consumer
+                                and not kv_cfg.is_kv_producer))
+    except Exception:
+        return False
+
+
+def _get_shared_kv_pool_num_blocks(vllm_config: VllmConfig,
+                                   page_size: int) -> Optional[int]:
+    if page_size <= 0:
+        return None
+    kv_cfg = vllm_config.kv_transfer_config
+    if kv_cfg is None:
+        return None
+    base = str(
+        kv_cfg.get_from_extra_config("shared_kv_pool_meta_path",
+                                     "/tmp/vllm_shared_kv_pool.pkl")).strip()
+    if not base:
+        return None
+    # Prefer device-specific metadata files but fallback to base path.
+    candidates = [base] + [f"{base}.cuda{i}" for i in range(16)]
+    for p in candidates:
+        if not os.path.exists(p):
+            continue
+        try:
+            with open(p, "rb") as f:
+                payload = pickle.load(f)
+            if not isinstance(payload, dict) or not payload:
+                continue
+            blocks: list[int] = []
+            for rec in payload.values():
+                if isinstance(rec, dict):
+                    size = rec.get("size")
+                    if isinstance(size, int) and size > 0:
+                        blocks.append(int(size // page_size))
+            blocks = [b for b in blocks if b > 0]
+            if blocks:
+                return min(blocks)
+        except Exception:
+            continue
+    return None
 
 
 def init_none_hash(hash_fn: Callable[[Any], bytes]):
@@ -695,6 +748,12 @@ def check_enough_kv_cache_memory(vllm_config: VllmConfig,
     if not kv_cache_spec:
         return
 
+    if _is_shared_kv_pool_consumer(vllm_config):
+        # Experimental shared-kv-pool mode: consumers map producer-exported
+        # KV tensors via CUDA IPC, so local KV-memory availability is not the
+        # hard limiter for cache capacity.
+        return
+
     if available_memory <= 0:
         raise ValueError("No available memory for the cache blocks. "
                          "Try increasing `gpu_memory_utilization` when "
@@ -1027,6 +1086,13 @@ def get_kv_cache_config_from_groups(vllm_config: VllmConfig,
         )
 
     # Determine how model runners should initialize the KV cache tensors.
+    shared_num_blocks_override: Optional[int] = None
+    if _is_shared_kv_pool_consumer(vllm_config):
+        # In shared-kv-pool consumer mode, allocator/block-table should follow
+        # the globally exported KV pool capacity from producer.
+        sample_page_size = kv_cache_groups[0].kv_cache_spec.page_size_bytes
+        shared_num_blocks_override = _get_shared_kv_pool_num_blocks(
+            vllm_config, sample_page_size)
     if len(kv_cache_groups) == 1 and \
         isinstance(kv_cache_groups[0].kv_cache_spec, UniformTypeKVCacheSpecs):
         # Special case: all layers have the same type of KV cache but with
@@ -1035,6 +1101,8 @@ def get_kv_cache_config_from_groups(vllm_config: VllmConfig,
         num_blocks = available_memory // kv_cache_groups[
             0].kv_cache_spec.page_size_bytes
         num_blocks = may_override_num_blocks(vllm_config, num_blocks)
+        if shared_num_blocks_override is not None:
+            num_blocks = shared_num_blocks_override
         per_layer_specs = kv_cache_groups[0].kv_cache_spec.kv_cache_specs
         kv_cache_tensors = [
             KVCacheTensor(size=per_layer_specs[layer_name].page_size_bytes *
@@ -1057,6 +1125,8 @@ def get_kv_cache_config_from_groups(vllm_config: VllmConfig,
         assert group_size > 0, "group_size must be greater than 0"
         num_blocks = get_num_blocks(vllm_config, group_size, available_memory,
                                     page_size)
+        if shared_num_blocks_override is not None:
+            num_blocks = shared_num_blocks_override
         kv_cache_tensors = []
         for i in range(group_size):
             shared_by = []

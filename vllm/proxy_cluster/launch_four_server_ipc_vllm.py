@@ -13,24 +13,34 @@ import urllib.request
 
 
 def _start(cmd: list[str], env: dict[str, str]) -> subprocess.Popen:
-    return subprocess.Popen(cmd, env=env)
+    # Put each launched server into its own process group so we can
+    # terminate the full tree (API server + engine children) reliably.
+    return subprocess.Popen(cmd, env=env, start_new_session=True)
 
 
 def _stop_all(children: list[subprocess.Popen]) -> None:
     for p in children:
-        if p.poll() is None:
-            p.terminate()
-    deadline = time.time() + 15
-    for p in children:
-        if p.poll() is None:
-            wait_s = max(0.0, deadline - time.time())
-            try:
-                p.wait(timeout=wait_s)
-            except subprocess.TimeoutExpired:
-                p.kill()
-    for p in children:
-        if p.poll() is None:
-            p.kill()
+        _stop_proc(p, timeout_s=15.0)
+
+
+def _stop_proc(proc: subprocess.Popen, timeout_s: float = 15.0) -> None:
+    if proc.poll() is not None:
+        return
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    except Exception:
+        proc.terminate()
+    try:
+        proc.wait(timeout=timeout_s)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            return
+        except Exception:
+            proc.kill()
 
 
 def _build_ipc_extra_config(role: str, meta_path: str, timeout_s: float, poll_s: float) -> str:
@@ -156,7 +166,14 @@ def _parse_csv(raw: str) -> list[str]:
     return [x.strip() for x in raw.split(",") if x.strip()]
 
 
-def _resolve_kv_transfer_config(raw: str | None, port: int) -> str | None:
+def _resolve_kv_transfer_config(raw: str | None,
+                                port: int,
+                                kv_owner_state_url: str = "",
+                                shared_kv_pool_enable: bool = False,
+                                shared_kv_pool_meta_path: str = "",
+                                shared_kv_pool_wait_timeout_s: float = 300.0,
+                                shared_kv_pool_poll_s: float = 0.1,
+                                shared_kv_pool_role: str = "") -> str | None:
     if not raw:
         return None
     replaced = raw.replace("{port}", str(port))
@@ -167,15 +184,49 @@ def _resolve_kv_transfer_config(raw: str | None, port: int) -> str | None:
 
     if not isinstance(obj, dict):
         return replaced
-    if obj.get("kv_connector") != "P2pNcclConnector":
+    connector = obj.get("kv_connector")
+    if connector not in {"P2pNcclConnector", "CudaIpcConnector"}:
         return replaced
 
     extra = obj.get("kv_connector_extra_config")
     if not isinstance(extra, dict):
         extra = {}
         obj["kv_connector_extra_config"] = extra
-    extra.setdefault("http_port", int(port))
+    if connector == "P2pNcclConnector":
+        extra.setdefault("http_port", int(port))
+    if connector == "CudaIpcConnector" and kv_owner_state_url:
+        extra.setdefault("kv_owner_state_url", kv_owner_state_url)
+    if connector == "CudaIpcConnector" and shared_kv_pool_enable:
+        extra.setdefault("shared_kv_pool_enable", True)
+        # Enable request-level global block table when shared KV pool is on.
+        extra.setdefault("shared_block_table_enable", True)
+        if shared_kv_pool_role:
+            extra.setdefault("shared_kv_pool_role", shared_kv_pool_role)
+        if shared_kv_pool_meta_path:
+            extra.setdefault("shared_kv_pool_meta_path",
+                             shared_kv_pool_meta_path)
+        extra.setdefault("shared_kv_pool_wait_timeout_s",
+                         float(shared_kv_pool_wait_timeout_s))
+        extra.setdefault("shared_kv_pool_poll_s",
+                         float(shared_kv_pool_poll_s))
     return json.dumps(obj, separators=(",", ":"))
+
+
+def _read_dynamic_active_upstream(control_path: str) -> str | None:
+    try:
+        with open(control_path, "r", encoding="utf-8") as f:
+            obj = json.load(f)
+    except FileNotFoundError:
+        return None
+    except Exception:
+        return None
+    if not isinstance(obj, dict):
+        return None
+    raw = obj.get("active_upstream")
+    if raw is None:
+        return None
+    val = str(raw).strip()
+    return val or None
 
 
 def main() -> int:
@@ -309,6 +360,80 @@ def main() -> int:
         default=180.0,
         help="Max wait for owner /v1/models ready before starting consumers.",
     )
+    parser.add_argument(
+        "--enable-dynamic-consumer-kv",
+        action="store_true",
+        help=(
+            "Enable dynamic consumer profile switching via control file. "
+            "Only one of server2/3/4 will use active KV profile at a time."
+        ),
+    )
+    parser.add_argument(
+        "--dynamic-kv-control-path",
+        default="/tmp/vllm_dynamic_kv_control.json",
+        help="Control JSON path written by router. Example: {\"active_upstream\":\"http://127.0.0.1:8102\"}",
+    )
+    parser.add_argument(
+        "--dynamic-kv-switch-timeout-s",
+        type=float,
+        default=120.0,
+        help="Wait timeout for restarted consumer /v1/models readiness.",
+    )
+    parser.add_argument(
+        "--active-consumer-gpu-memory-utilization",
+        type=float,
+        default=0.2,
+        help="GPU memory utilization for active consumer (server2/3/4).",
+    )
+    parser.add_argument(
+        "--active-consumer-max-num-seqs",
+        type=int,
+        default=16,
+        help="max-num-seqs for active consumer (server2/3/4).",
+    )
+    parser.add_argument(
+        "--dynamic-kv-auto-demote",
+        action="store_true",
+        help=(
+            "Automatically demote previously active consumers back to inactive "
+            "profile when active_upstream changes. Disabled by default to avoid "
+            "killing CUDA-IPC source process before next hop consumes KV."
+        ),
+    )
+    parser.add_argument(
+        "--kv-owner-state-url",
+        default="",
+        help=(
+            "Optional KV owner state server URL. When set and kv_connector is "
+            "CudaIpcConnector, this URL is auto-injected into "
+            "kv_connector_extra_config.kv_owner_state_url."
+        ),
+    )
+    parser.add_argument(
+        "--shared-kv-pool-enable",
+        action="store_true",
+        help=(
+            "Enable experimental single shared KV pool export/import. "
+            "Owner exports one KV pool, consumers map it via CUDA IPC."
+        ),
+    )
+    parser.add_argument(
+        "--shared-kv-pool-meta-path",
+        default="/tmp/vllm_shared_kv_pool.pkl",
+        help="Metadata path for experimental shared KV pool CUDA IPC handles.",
+    )
+    parser.add_argument(
+        "--shared-kv-pool-wait-timeout-s",
+        type=float,
+        default=300.0,
+        help="Consumer wait timeout for shared KV pool metadata.",
+    )
+    parser.add_argument(
+        "--shared-kv-pool-poll-s",
+        type=float,
+        default=0.1,
+        help="Poll interval for shared KV pool metadata file.",
+    )
     args, vllm_extra = parser.parse_known_args()
 
     host = args.host
@@ -355,11 +480,22 @@ def main() -> int:
         kv_transfer_config=_resolve_kv_transfer_config(
             args.owner_kv_transfer_config or args.kv_transfer_config_template,
             args.server1_port,
+            args.kv_owner_state_url,
+            args.shared_kv_pool_enable,
+            args.shared_kv_pool_meta_path,
+            args.shared_kv_pool_wait_timeout_s,
+            args.shared_kv_pool_poll_s,
+            "producer",
         ),
     )
     owner_env = dict(base_env)
     if args.owner_cuda_visible_devices:
         owner_env["CUDA_VISIBLE_DEVICES"] = args.owner_cuda_visible_devices
+    if args.shared_kv_pool_enable:
+        owner_env["VLLM_SHARED_BLOCK_ALLOCATOR_ENABLE"] = "1"
+        owner_env["VLLM_SHARED_BLOCK_ALLOCATOR_PATH"] = (
+            args.shared_kv_pool_meta_path + ".alloc")
+        owner_env["VLLM_SHARED_BLOCK_ALLOCATOR_RESET"] = "1"
     children.append(_start(owner_cmd, owner_env))
     time.sleep(args.owner_startup_delay_s)
     owner_url = f"http://127.0.0.1:{args.server1_port}"
@@ -371,38 +507,20 @@ def main() -> int:
         return 1
 
     consumer_visible_devices = _parse_csv(args.consumer_cuda_visible_devices)
-    for idx, p in enumerate((args.server2_port, args.server3_port, args.server4_port)):
-        consumer_extra = _strip_overridden_args(
-            vllm_extra,
-            {
-                "--gpu-memory-utilization",
-                "--max-num-seqs",
-                "--max-model-len",
-                "--compilation-config",
-                "--tensor-parallel-size",
-                "--kv-transfer-config",
-            },
-        )
-        cmd = _build_vllm_cmd(
-            host=host,
-            port=p,
-            model=args.model,
-            role="consumer",
-            meta_path=args.ipc_meta_path,
-            timeout_s=args.ipc_wait_timeout_s,
-            poll_s=args.ipc_poll_interval_s,
-            extra_args=consumer_extra,
-            gpu_memory_utilization=args.consumer_gpu_memory_utilization,
-            max_num_seqs=args.consumer_max_num_seqs,
-            max_model_len=args.consumer_max_model_len,
-            enforce_eager=not args.no_consumer_enforce_eager,
-            compilation_config=args.consumer_compilation_config,
-            tensor_parallel_size=args.consumer_tensor_parallel_size,
-            kv_transfer_config=_resolve_kv_transfer_config(
-                args.consumer_kv_transfer_config or args.kv_transfer_config_template,
-                p,
-            ),
-        )
+    consumer_ports = [args.server2_port, args.server3_port, args.server4_port]
+    consumer_extra = _strip_overridden_args(
+        vllm_extra,
+        {
+            "--gpu-memory-utilization",
+            "--max-num-seqs",
+            "--max-model-len",
+            "--compilation-config",
+            "--tensor-parallel-size",
+            "--kv-transfer-config",
+        },
+    )
+
+    def _consumer_env(idx: int) -> dict[str, str]:
         env = dict(base_env)
         if args.consumer_cuda_visible_devices_all:
             env["CUDA_VISIBLE_DEVICES"] = args.consumer_cuda_visible_devices_all
@@ -410,7 +528,53 @@ def main() -> int:
             env["CUDA_VISIBLE_DEVICES"] = consumer_visible_devices[idx]
         if args.consumer_attention_backend:
             env["VLLM_ATTENTION_BACKEND"] = args.consumer_attention_backend
-        children.append(_start(cmd, env))
+        if args.shared_kv_pool_enable:
+            env["VLLM_SHARED_BLOCK_ALLOCATOR_ENABLE"] = "1"
+            env["VLLM_SHARED_BLOCK_ALLOCATOR_PATH"] = (
+                args.shared_kv_pool_meta_path + ".alloc")
+            env["VLLM_SHARED_BLOCK_ALLOCATOR_RESET"] = "0"
+        return env
+
+    def _consumer_cmd(port: int, active_profile: bool) -> list[str]:
+        gpu_util = args.active_consumer_gpu_memory_utilization if active_profile \
+            else args.consumer_gpu_memory_utilization
+        max_num_seqs = args.active_consumer_max_num_seqs if active_profile \
+            else args.consumer_max_num_seqs
+        return _build_vllm_cmd(
+            host=host,
+            port=port,
+            model=args.model,
+            role="consumer",
+            meta_path=args.ipc_meta_path,
+            timeout_s=args.ipc_wait_timeout_s,
+            poll_s=args.ipc_poll_interval_s,
+            extra_args=consumer_extra,
+            gpu_memory_utilization=gpu_util,
+            max_num_seqs=max_num_seqs,
+            max_model_len=args.consumer_max_model_len,
+            enforce_eager=not args.no_consumer_enforce_eager,
+            compilation_config=args.consumer_compilation_config,
+            tensor_parallel_size=args.consumer_tensor_parallel_size,
+            kv_transfer_config=_resolve_kv_transfer_config(
+                args.consumer_kv_transfer_config or args.kv_transfer_config_template,
+                port,
+                args.kv_owner_state_url,
+                args.shared_kv_pool_enable,
+                args.shared_kv_pool_meta_path,
+                args.shared_kv_pool_wait_timeout_s,
+                args.shared_kv_pool_poll_s,
+                "consumer",
+            ),
+        )
+
+    # child slots: 0=owner, 1..3=consumers 2..4
+    consumer_active_profile: dict[int, bool] = {}
+    for idx, p in enumerate(consumer_ports):
+        use_active = False
+        children.append(_start(_consumer_cmd(p, use_active), _consumer_env(idx)))
+        consumer_active_profile[p] = use_active
+
+    dynamic_active_upstream: str | None = None
 
     print(
         "\nStarted 4 vLLM servers (experimental ipc_weight_share):\n"
@@ -422,14 +586,49 @@ def main() -> int:
     )
     print("Press Ctrl+C to stop all.")
 
+    if args.enable_dynamic_consumer_kv:
+        print(f"Dynamic consumer KV enabled. control path: {args.dynamic_kv_control_path}")
+
     while True:
+        if args.enable_dynamic_consumer_kv:
+            desired_upstream = _read_dynamic_active_upstream(args.dynamic_kv_control_path)
+            if desired_upstream != dynamic_active_upstream:
+                dynamic_active_upstream = desired_upstream
+                for i, port in enumerate(consumer_ports):
+                    should_active = (dynamic_active_upstream == f"http://127.0.0.1:{port}")
+                    if (not args.dynamic_kv_auto_demote
+                            and not should_active
+                            and consumer_active_profile[port]):
+                        # Keep already-active consumers alive by default.
+                        # This avoids invalidating CUDA IPC handles mid-handoff.
+                        continue
+                    if should_active == consumer_active_profile[port]:
+                        continue
+                    print(
+                        f"[dynamic-kv] Switching server:{port} "
+                        f"{'inactive->active' if should_active else 'active->inactive'}"
+                    )
+                    child_idx = i + 1
+                    _stop_proc(children[child_idx])
+                    children[child_idx] = _start(_consumer_cmd(port, should_active), _consumer_env(i))
+                    consumer_active_profile[port] = should_active
+                    try:
+                        _wait_owner_ready(f"http://127.0.0.1:{port}",
+                                          args.dynamic_kv_switch_timeout_s)
+                    except Exception as e:
+                        # Keep the cluster alive; only this consumer switch failed.
+                        # Router readiness checks will surface the error for hops that
+                        # require this upstream.
+                        print(f"[dynamic-kv] server {port} failed to become ready after switch: {e}")
+                        consumer_active_profile[port] = False
+
         for p in children:
             code = p.poll()
             if code is not None:
                 print(f"Child process exited unexpectedly (pid={p.pid}, code={code}). Stopping cluster.")
                 _stop_all(children)
                 return 1
-        time.sleep(1.0)
+        time.sleep(0.2)
 
 
 if __name__ == "__main__":

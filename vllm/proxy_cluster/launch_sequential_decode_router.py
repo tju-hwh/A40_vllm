@@ -80,6 +80,12 @@ def main() -> int:
     )
     parser.add_argument("--request-timeout-s", type=float, default=300.0)
     parser.add_argument("--connect-timeout-s", type=float, default=30.0)
+    parser.add_argument(
+        "--max-response-length",
+        type=int,
+        default=4096,
+        help="Hard upper bound for per-request max_tokens at router ingress.",
+    )
     parser.add_argument("--verbose-log", action="store_true")
     parser.add_argument(
         "--require-kv-transfer",
@@ -99,6 +105,39 @@ def main() -> int:
         "--skip-wait-upstreams-ready",
         action="store_true",
         help="Start router immediately without waiting upstream /v1/models ready.",
+    )
+    parser.add_argument(
+        "--dynamic-kv-control-path",
+        default="",
+        help=(
+            "Optional control JSON path for dynamic consumer KV switching. "
+            "When set, router writes active_upstream before each handoff hop."
+        ),
+    )
+    parser.add_argument(
+        "--dynamic-kv-wait-timeout-s",
+        type=float,
+        default=120.0,
+        help="Wait timeout for upstream ready after dynamic KV switch.",
+    )
+    parser.add_argument(
+        "--dynamic-kv-settle-s",
+        type=float,
+        default=2.0,
+        help="Delay after writing dynamic KV control to avoid restart race.",
+    )
+    parser.add_argument(
+        "--kv-owner-state-url",
+        default="",
+        help=(
+            "Optional KV owner state server URL, e.g. http://127.0.0.1:8300. "
+            "When set, router sends acquire/commit/release control events per hop."
+        ),
+    )
+    parser.add_argument(
+        "--kv-owner-state-strict",
+        action="store_true",
+        help="Fail request if KV owner state server acquire/commit fails.",
     )
     args = parser.parse_args()
 
@@ -126,8 +165,14 @@ def main() -> int:
     env["SEQUENTIAL_DECODE_TOKENS"] = args.decode_cutovers
     env["REQUEST_TIMEOUT_S"] = str(args.request_timeout_s)
     env["CONNECT_TIMEOUT_S"] = str(args.connect_timeout_s)
+    env["MAX_RESPONSE_LENGTH"] = str(max(1, int(args.max_response_length)))
     env["PROXY_VERBOSE_LOG"] = "1" if args.verbose_log else "0"
     env["REQUIRE_KV_TRANSFER"] = "1" if args.require_kv_transfer else "0"
+    env["DYNAMIC_KV_CONTROL_PATH"] = args.dynamic_kv_control_path
+    env["DYNAMIC_KV_WAIT_TIMEOUT_S"] = str(args.dynamic_kv_wait_timeout_s)
+    env["DYNAMIC_KV_SETTLE_S"] = str(args.dynamic_kv_settle_s)
+    env["KV_OWNER_STATE_URL"] = args.kv_owner_state_url
+    env["KV_OWNER_STATE_STRICT"] = "1" if args.kv_owner_state_strict else "0"
 
     upstreams = [
         args.server1_url.rstrip("/"),
@@ -166,6 +211,9 @@ def main() -> int:
         f"  routing mode: {args.routing_mode}\n"
         f"  block size: {args.block_size}\n"
         f"  decode cutovers: {args.decode_cutovers}\n"
+        f"  max response length: {args.max_response_length}\n"
+        f"  dynamic kv control path: {args.dynamic_kv_control_path or '(disabled)'}\n"
+        f"  kv owner state url: {args.kv_owner_state_url or '(disabled)'}\n"
         f"  targets: {args.server1_url}, {args.server2_url}, {args.server3_url}, {args.server4_url}\n"
     )
     if args.routing_mode == "sequential_blocks":

@@ -126,7 +126,13 @@ class SingleTypeKVCacheManager(ABC):
         if num_new_blocks <= 0:
             return []
         else:
-            new_blocks = self.block_pool.get_new_blocks(num_new_blocks)
+            # In shared-allocator mode, allocate by request range to keep
+            # a global request->block-table mapping consistent across servers.
+            new_blocks = self.block_pool.get_new_blocks_for_request(
+                request_id=request_id,
+                start=len(req_blocks),
+                end=num_required_blocks,
+            )
             req_blocks.extend(new_blocks)
             return new_blocks
 
@@ -167,7 +173,7 @@ class SingleTypeKVCacheManager(ABC):
         # freed first.
         ordered_blocks = reversed(req_blocks)
 
-        self.block_pool.free_blocks(ordered_blocks)
+        self.block_pool.free_blocks(ordered_blocks, request_id=request_id)
         self.num_cached_block.pop(request_id, None)
 
     @abstractmethod
@@ -388,7 +394,7 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
                 break
             removed_blocks.append(blocks[i])
             blocks[i] = self._null_block
-        self.block_pool.free_blocks(removed_blocks)
+        self.block_pool.free_blocks(removed_blocks, request_id=request_id)
 
     def get_num_common_prefix_blocks(self, request_id: str,
                                      num_running_requests: int) -> int:
@@ -516,7 +522,7 @@ class ChunkedLocalAttentionManager(SingleTypeKVCacheManager):
                 break
             removed_blocks.append(blocks[i])
             blocks[i] = self._null_block
-        self.block_pool.free_blocks(removed_blocks)
+        self.block_pool.free_blocks(removed_blocks, request_id=request_id)
 
     def get_num_common_prefix_blocks(self, request_id: str,
                                      num_running_requests: int) -> int:

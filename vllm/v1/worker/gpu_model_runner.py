@@ -3,6 +3,8 @@
 
 import gc
 import itertools
+import os
+import pickle
 import time
 from collections import defaultdict
 from collections.abc import Iterator
@@ -190,6 +192,38 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         self.scheduler_config = vllm_config.scheduler_config
         self.speculative_config = vllm_config.speculative_config
         self.observability_config = vllm_config.observability_config
+        self._shared_kv_pool_enable = False
+        self._shared_kv_pool_meta_path = "/tmp/vllm_shared_kv_pool.pkl"
+        self._shared_kv_pool_wait_timeout_s = 300.0
+        self._shared_kv_pool_poll_s = 0.1
+        self._shared_kv_pool_is_producer = False
+        self._shared_kv_pool_is_consumer = False
+        self._shared_kv_pool_role = ""
+
+        kv_transfer_cfg = vllm_config.kv_transfer_config
+        if kv_transfer_cfg is not None:
+            self._shared_kv_pool_enable = bool(
+                kv_transfer_cfg.get_from_extra_config(
+                    "shared_kv_pool_enable", False))
+            self._shared_kv_pool_meta_path = str(
+                kv_transfer_cfg.get_from_extra_config(
+                    "shared_kv_pool_meta_path", self._shared_kv_pool_meta_path
+                ))
+            self._shared_kv_pool_wait_timeout_s = float(
+                kv_transfer_cfg.get_from_extra_config(
+                    "shared_kv_pool_wait_timeout_s",
+                    self._shared_kv_pool_wait_timeout_s,
+                ))
+            self._shared_kv_pool_poll_s = float(
+                kv_transfer_cfg.get_from_extra_config(
+                    "shared_kv_pool_poll_s",
+                    self._shared_kv_pool_poll_s,
+                ))
+            self._shared_kv_pool_is_producer = kv_transfer_cfg.is_kv_producer
+            self._shared_kv_pool_is_consumer = kv_transfer_cfg.is_kv_consumer
+            self._shared_kv_pool_role = str(
+                kv_transfer_cfg.get_from_extra_config(
+                    "shared_kv_pool_role", "")).strip().lower()
 
         from vllm.model_executor.models.utils import set_cpu_offload_max_bytes
         set_cpu_offload_max_bytes(
@@ -3768,12 +3802,16 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             corresponding memory buffer for KV cache.
          """
         kv_cache_raw_tensors: dict[str, torch.Tensor] = {}
-        for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
-            tensor = torch.zeros(kv_cache_tensor.size,
-                                 dtype=torch.int8,
-                                 device=self.device)
-            for layer_name in kv_cache_tensor.shared_by:
-                kv_cache_raw_tensors[layer_name] = tensor
+        use_shared_consumer = self._shared_kv_pool_enable and (
+            self._shared_kv_pool_role == "consumer" or
+            (self._shared_kv_pool_is_consumer and not self._shared_kv_pool_is_producer)
+        )
+        if use_shared_consumer:
+            kv_cache_raw_tensors = self._allocate_shared_kv_cache_tensors_consumer(
+                kv_cache_config)
+        else:
+            kv_cache_raw_tensors = self._allocate_shared_or_local_kv_cache_tensors_producer(
+                kv_cache_config)
 
         layer_names = set()
         for group in kv_cache_config.kv_cache_groups:
@@ -3784,6 +3822,95 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         assert layer_names == set(kv_cache_raw_tensors.keys(
         )), "Some layers are not correctly initialized"
         return kv_cache_raw_tensors
+
+    def _allocate_shared_or_local_kv_cache_tensors_producer(
+            self, kv_cache_config: KVCacheConfig) -> dict[str, torch.Tensor]:
+        kv_cache_raw_tensors: dict[str, torch.Tensor] = {}
+        shared_payload: dict[str, dict[str, Any]] = {}
+        for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
+            tensor = torch.zeros(kv_cache_tensor.size,
+                                 dtype=torch.int8,
+                                 device=self.device)
+            shared_by = list(kv_cache_tensor.shared_by)
+            for layer_name in shared_by:
+                kv_cache_raw_tensors[layer_name] = tensor
+
+            if self._shared_kv_pool_enable and self._shared_kv_pool_is_producer:
+                from vllm.proxy_cluster.ipc_state_dict import export_cuda_tensor_meta
+
+                group_key = shared_by[0]
+                shared_payload[group_key] = {
+                    "shared_by": shared_by,
+                    "meta": export_cuda_tensor_meta(tensor),
+                    "size": int(kv_cache_tensor.size),
+                }
+
+        if self._shared_kv_pool_enable and self._shared_kv_pool_is_producer:
+            self._dump_shared_kv_pool_meta(shared_payload)
+            logger.info("shared_kv_pool producer exported groups=%d path=%s",
+                        len(shared_payload), self._shared_kv_pool_meta_path)
+
+        return kv_cache_raw_tensors
+
+    def _allocate_shared_kv_cache_tensors_consumer(
+            self, kv_cache_config: KVCacheConfig) -> dict[str, torch.Tensor]:
+        from vllm.proxy_cluster.ipc_state_dict import rebuild_cuda_tensor_from_meta
+
+        payload = self._wait_shared_kv_pool_meta()
+        kv_cache_raw_tensors: dict[str, torch.Tensor] = {}
+        for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
+            shared_by = list(kv_cache_tensor.shared_by)
+            group_key = shared_by[0]
+            rec = payload.get(group_key)
+            if not isinstance(rec, dict) or not isinstance(rec.get("meta"), dict):
+                raise RuntimeError(
+                    f"shared_kv_pool missing meta for group {group_key}")
+            tensor = rebuild_cuda_tensor_from_meta(rec["meta"])
+            if not tensor.is_cuda:
+                raise RuntimeError(
+                    f"shared_kv_pool rebuilt tensor is not cuda for group {group_key}"
+                )
+            for layer_name in shared_by:
+                kv_cache_raw_tensors[layer_name] = tensor
+
+        logger.info("shared_kv_pool consumer imported groups=%d path=%s",
+                    len(kv_cache_config.kv_cache_tensors),
+                    self._shared_kv_pool_meta_path)
+        return kv_cache_raw_tensors
+
+    def _dump_shared_kv_pool_meta(self, payload: dict[str, dict[str, Any]]) -> None:
+        path = self._shared_kv_pool_meta_path_for_local_device()
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        tmp = f"{path}.tmp.{os.getpid()}"
+        with open(tmp, "wb") as f:
+            pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
+        os.replace(tmp, path)
+
+    def _wait_shared_kv_pool_meta(self) -> dict[str, dict[str, Any]]:
+        deadline = time.time() + self._shared_kv_pool_wait_timeout_s
+        path = self._shared_kv_pool_meta_path_for_local_device()
+        last_err = ""
+        while time.time() < deadline:
+            if os.path.exists(path):
+                try:
+                    with open(path, "rb") as f:
+                        payload = pickle.load(f)
+                    if isinstance(payload, dict) and payload:
+                        return payload
+                except Exception as exc:
+                    last_err = repr(exc)
+            time.sleep(self._shared_kv_pool_poll_s)
+        raise RuntimeError(
+            f"shared_kv_pool meta wait timeout path={path} last_err={last_err}")
+
+    def _shared_kv_pool_meta_path_for_local_device(self) -> str:
+        path = self._shared_kv_pool_meta_path
+        if getattr(self.device, "type", "") != "cuda":
+            return path
+        dev_idx = self.device.index
+        if dev_idx is None:
+            dev_idx = torch.cuda.current_device()
+        return f"{path}.cuda{int(dev_idx)}"
 
     def _attn_group_iterator(self) -> Iterator[AttentionGroup]:
         return itertools.chain.from_iterable(self.attn_groups)
