@@ -61,6 +61,10 @@ class ResetReq(BaseModel):
     request_id: str
 
 
+class RegisterKVBatchReq(BaseModel):
+    items: list[RegisterKVReq]
+
+
 def create_app() -> FastAPI:
     app = FastAPI(title="KV Owner State Server", version="0.1.0")
     states: dict[str, RequestState] = {}
@@ -143,17 +147,44 @@ def create_app() -> FastAPI:
         if st is None:
             st = RequestState(request_id=rid)
             states[rid] = st
+        new_num_tokens = int(req.num_tokens)
+        new_num_blocks = int(req.num_blocks)
+        new_block_ids = [int(x) for x in req.block_ids]
+        old = st.kv_by_layer.get(req.layer_name)
+        if old is not None:
+            old_num_tokens = int(old.get("num_tokens", 0))
+            old_num_blocks = int(old.get("num_blocks", 0))
+            old_block_ids = [int(x) for x in old.get("block_ids", [])]
+            # KV metadata should be monotonic for a request/layer. Never let a
+            # shorter update overwrite a longer one, otherwise downstream
+            # lookup may observe regressed block coverage and produce dst/src
+            # mismatches during handoff.
+            if old_num_tokens > new_num_tokens:
+                new_num_tokens = old_num_tokens
+            if old_num_blocks > new_num_blocks:
+                new_num_blocks = old_num_blocks
+                new_block_ids = old_block_ids
+            elif len(old_block_ids) > len(new_block_ids):
+                # Keep the longer block-id list if block counts tie or caller
+                # reports fewer ids than previously registered.
+                new_block_ids = old_block_ids
         st.kv_by_layer[req.layer_name] = {
             "tensor_key": req.tensor_key,
-            "num_tokens": int(req.num_tokens),
-            "num_blocks": int(req.num_blocks),
-            "block_ids": [int(x) for x in req.block_ids],
+            "num_tokens": new_num_tokens,
+            "num_blocks": new_num_blocks,
+            "block_ids": new_block_ids,
             "worker": req.worker,
             "hop": int(req.hop),
             "updated_at": time.time(),
         }
         st.updated_at = time.time()
         return {"ok": True}
+
+    @app.post("/register_kv_batch")
+    async def register_kv_batch(req: RegisterKVBatchReq) -> dict[str, Any]:
+        for item in req.items:
+            await register_kv(item)
+        return {"ok": True, "count": len(req.items)}
 
     @app.post("/lookup_kv")
     async def lookup_kv(req: LookupKVReq) -> dict[str, Any]:

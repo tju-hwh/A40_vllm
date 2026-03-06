@@ -46,6 +46,11 @@ class ProxyConfig:
     dynamic_kv_settle_s: float
     kv_owner_state_url: str
     kv_owner_state_strict: bool
+    kv_handoff_serial_barrier: bool
+    kv_handoff_min_layers: int
+    kv_handoff_wait_timeout_s: float
+    kv_handoff_stable_polls: int
+    kv_handoff_soft_min_layers: int
     max_response_length: int
     upstream_max_model_len: int
 
@@ -121,6 +126,16 @@ class ProxyConfig:
             dynamic_kv_settle_s=float(os.getenv("DYNAMIC_KV_SETTLE_S", "2.0")),
             kv_owner_state_url=os.getenv("KV_OWNER_STATE_URL", "").strip(),
             kv_owner_state_strict=_parse_bool(os.getenv("KV_OWNER_STATE_STRICT"), default=False),
+            kv_handoff_serial_barrier=_parse_bool(
+                os.getenv("KV_HANDOFF_SERIAL_BARRIER"), default=True),
+            kv_handoff_min_layers=max(
+                1, int(os.getenv("KV_HANDOFF_MIN_LAYERS", "56"))),
+            kv_handoff_wait_timeout_s=float(
+                os.getenv("KV_HANDOFF_WAIT_TIMEOUT_S", "20")),
+            kv_handoff_stable_polls=max(
+                1, int(os.getenv("KV_HANDOFF_STABLE_POLLS", "2"))),
+            kv_handoff_soft_min_layers=max(
+                1, int(os.getenv("KV_HANDOFF_SOFT_MIN_LAYERS", "8"))),
             max_response_length=max(1, int(os.getenv("MAX_RESPONSE_LENGTH", "4096"))),
             upstream_max_model_len=max(
                 1, int(os.getenv("UPSTREAM_MAX_MODEL_LEN", "3072"))),
@@ -431,6 +446,48 @@ async def _handle_completion_sequential_handoff(
         except Exception:
             return False
 
+    async def kv_owner_wait_ready(req_id: str, min_layers: int, timeout_s: float,
+                                  stable_polls: int, soft_min_layers: int,
+                                  required_prev_hop: int) -> bool:
+        if not cfg.kv_owner_state_url:
+            return True
+        deadline = time.time() + max(0.1, timeout_s)
+        good = 0
+        while time.time() < deadline:
+            try:
+                resp = await client.get(
+                    cfg.kv_owner_state_url.rstrip("/") + f"/state/{req_id}")
+                if 200 <= resp.status_code < 300:
+                    obj = resp.json()
+                    if bool(obj.get("ok", False)):
+                        n_layers = int(obj.get("num_kv_layers", 0))
+                        committed_tokens = int(obj.get("committed_tokens", 0))
+                        last_hop = int(obj.get("last_hop", 0))
+                        # Primary readiness in serial-handoff mode:
+                        # previous hop has committed generation for this request.
+                        commit_ready = (
+                            last_hop >= int(required_prev_hop)
+                            and committed_tokens > 0
+                        )
+                        hard_ready = n_layers >= int(min_layers)
+                        soft_ready = (
+                            n_layers >= int(soft_min_layers)
+                        )
+                        if commit_ready or hard_ready or soft_ready:
+                            good += 1
+                            if good >= stable_polls:
+                                return True
+                        else:
+                            good = 0
+                    else:
+                        good = 0
+                else:
+                    good = 0
+            except Exception:
+                good = 0
+            await asyncio.sleep(0.1)
+        return False
+
     try:
         req_obj = json.loads(body.decode("utf-8"))
     except Exception as exc:
@@ -569,18 +626,40 @@ async def _handle_completion_sequential_handoff(
             next_target,
             next_kv_port,
         )
-        if hop_idx > 1:
-            if not await kv_owner_acquire(base_request_id, target_base, hop_idx):
-                if cfg.kv_owner_state_strict:
-                    return JSONResponse(
-                        status_code=502,
-                        content={
-                            "error": "kv_owner_acquire_failed",
-                            "upstream": target_base,
-                            "hop": hop_idx,
-                            "decode_idx": decode_idx,
-                        },
-                    )
+        # Serial handoff barrier: before switching to next server, wait until
+        # producer KV metadata is visible in owner-state.
+        if hop_idx > 1 and cfg.kv_handoff_serial_barrier:
+            ready = await kv_owner_wait_ready(
+                base_request_id,
+                cfg.kv_handoff_min_layers,
+                cfg.kv_handoff_wait_timeout_s,
+                cfg.kv_handoff_stable_polls,
+                cfg.kv_handoff_soft_min_layers,
+                hop_idx - 1,
+            )
+            if not ready:
+                return JSONResponse(
+                    status_code=502,
+                    content={
+                        "error": "kv_handoff_barrier_timeout",
+                        "upstream": target_base,
+                        "hop": hop_idx,
+                        "decode_idx": decode_idx,
+                        "min_layers": cfg.kv_handoff_min_layers,
+                        "soft_min_layers": cfg.kv_handoff_soft_min_layers,
+                    },
+                )
+        if not await kv_owner_acquire(base_request_id, target_base, hop_idx):
+            if cfg.kv_owner_state_strict:
+                return JSONResponse(
+                    status_code=502,
+                    content={
+                        "error": "kv_owner_acquire_failed",
+                        "upstream": target_base,
+                        "hop": hop_idx,
+                        "decode_idx": decode_idx,
+                    },
+                )
         if cfg.verbose_log:
             print(
                 f"[proxy:{cfg.role}] handoff decode_idx={decode_idx} "
@@ -659,8 +738,14 @@ async def _handle_completion_sequential_handoff(
                 f"hop={hop_idx}/{len(plan)} done status={resp.status_code} "
                 f"text_len={len(hop_text)}"
             )
-        # In token-id chaining mode each hop returns newly generated text.
-        generated_text += hop_text
+        # Hop outputs are not always strictly incremental across engines.
+        # Some paths may return cumulative text; merge defensively.
+        if not generated_text:
+            generated_text = hop_text
+        elif _is_cumulative_hop_text(generated_text, hop_text):
+            generated_text = _merge_hop_text(generated_text, hop_text)
+        else:
+            generated_text = generated_text + hop_text
         choices_obj = resp_obj.get("choices")
         if isinstance(choices_obj, list) and choices_obj:
             ch0 = choices_obj[0] if isinstance(choices_obj[0], dict) else {}
@@ -674,19 +759,18 @@ async def _handle_completion_sequential_handoff(
         usage_obj = resp_obj.get("usage") or {}
         hop_completion_tokens = int(usage_obj.get("completion_tokens", 0)) \
             if isinstance(usage_obj.get("completion_tokens"), int) else 0
-        if hop_idx > 1:
-            if not await kv_owner_commit(base_request_id, target_base, hop_idx,
-                                         hop_completion_tokens):
-                if cfg.kv_owner_state_strict:
-                    return JSONResponse(
-                        status_code=502,
-                        content={
-                            "error": "kv_owner_commit_failed",
-                            "upstream": target_base,
-                            "hop": hop_idx,
-                            "decode_idx": decode_idx,
-                        },
-                    )
+        if not await kv_owner_commit(base_request_id, target_base, hop_idx,
+                                     hop_completion_tokens):
+            if cfg.kv_owner_state_strict:
+                return JSONResponse(
+                    status_code=502,
+                    content={
+                        "error": "kv_owner_commit_failed",
+                        "upstream": target_base,
+                        "hop": hop_idx,
+                        "decode_idx": decode_idx,
+                    },
+                )
         next_kv_transfer_params = resp_obj.get("kv_transfer_params")
         if not is_last_hop and cfg.require_kv_transfer and not isinstance(next_kv_transfer_params, dict):
             return JSONResponse(
@@ -773,6 +857,10 @@ def create_app() -> FastAPI:
             "sequential_targets": cfg.sequential_targets,
             "sequential_target_kv_ports": cfg.sequential_target_kv_ports,
             "sequential_decode_tokens": cfg.sequential_decode_tokens,
+            "kv_handoff_serial_barrier": cfg.kv_handoff_serial_barrier,
+            "kv_handoff_min_layers": cfg.kv_handoff_min_layers,
+            "kv_handoff_wait_timeout_s": cfg.kv_handoff_wait_timeout_s,
+            "kv_handoff_soft_min_layers": cfg.kv_handoff_soft_min_layers,
             "decode_request_count": state.decode_request_count,
             "decode_target_counts": state.decode_target_counts,
             "post_cutover_rr_index": state.post_cutover_rr_index,
