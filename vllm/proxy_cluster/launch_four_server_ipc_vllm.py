@@ -271,6 +271,14 @@ def main() -> int:
         help="Owner server --tensor-parallel-size.",
     )
     parser.add_argument(
+        "--owner-compilation-config",
+        default="",
+        help=(
+            "Optional JSON string passed to owner --compilation-config. "
+            "If empty, owner uses vLLM default compilation config."
+        ),
+    )
+    parser.add_argument(
         "--consumer-gpu-memory-utilization",
         type=float,
         default=0.1,
@@ -303,6 +311,30 @@ def main() -> int:
         "--consumer-compilation-config",
         default='{"level":0,"use_inductor":false,"use_cudagraph":false}',
         help="JSON string passed to consumer --compilation-config.",
+    )
+    parser.add_argument(
+        "--server2-compilation-config",
+        default="",
+        help=(
+            "Optional JSON for server2 --compilation-config. "
+            "Overrides --consumer-compilation-config when set."
+        ),
+    )
+    parser.add_argument(
+        "--server3-compilation-config",
+        default="",
+        help=(
+            "Optional JSON for server3 --compilation-config. "
+            "Overrides --consumer-compilation-config when set."
+        ),
+    )
+    parser.add_argument(
+        "--server4-compilation-config",
+        default="",
+        help=(
+            "Optional JSON for server4 --compilation-config. "
+            "Overrides --consumer-compilation-config when set."
+        ),
     )
     parser.add_argument(
         "--owner-cuda-visible-devices",
@@ -476,6 +508,7 @@ def main() -> int:
         gpu_memory_utilization=args.owner_gpu_memory_utilization,
         max_num_seqs=args.owner_max_num_seqs,
         max_model_len=args.owner_max_model_len,
+        compilation_config=(args.owner_compilation_config or None),
         tensor_parallel_size=args.owner_tensor_parallel_size,
         kv_transfer_config=_resolve_kv_transfer_config(
             args.owner_kv_transfer_config or args.kv_transfer_config_template,
@@ -540,6 +573,12 @@ def main() -> int:
             else args.consumer_gpu_memory_utilization
         max_num_seqs = args.active_consumer_max_num_seqs if active_profile \
             else args.consumer_max_num_seqs
+        per_server_comp_cfg = {
+            args.server2_port: args.server2_compilation_config,
+            args.server3_port: args.server3_compilation_config,
+            args.server4_port: args.server4_compilation_config,
+        }.get(port, "")
+        comp_cfg = per_server_comp_cfg or args.consumer_compilation_config
         return _build_vllm_cmd(
             host=host,
             port=port,
@@ -553,7 +592,7 @@ def main() -> int:
             max_num_seqs=max_num_seqs,
             max_model_len=args.consumer_max_model_len,
             enforce_eager=not args.no_consumer_enforce_eager,
-            compilation_config=args.consumer_compilation_config,
+            compilation_config=comp_cfg,
             tensor_parallel_size=args.consumer_tensor_parallel_size,
             kv_transfer_config=_resolve_kv_transfer_config(
                 args.consumer_kv_transfer_config or args.kv_transfer_config_template,

@@ -22,6 +22,20 @@ TIMEOUT_S=${TIMEOUT_S:-"900"}
 OWNER_MAX_NUM_SEQS=${OWNER_MAX_NUM_SEQS:-"$CONCURRENCY"}
 CONSUMER_MAX_NUM_SEQS=${CONSUMER_MAX_NUM_SEQS:-"$CONCURRENCY"}
 
+# Per-server CUDA graph capture configs (override by env if needed).
+# OWNER_COMPILATION_CONFIG=${OWNER_COMPILATION_CONFIG:-'{"level":3,"use_inductor":true,"use_cudagraph":true,"cudagraph_capture_sizes":[256,248,240,232,224,216,208,200,192,184,176,168,160,152,144,136,128,120,112,104,96,88,80,72,64,56,48,40,32,24,16,8,4,2,1]}'}
+# SERVER2_COMPILATION_CONFIG=${SERVER2_COMPILATION_CONFIG:-'{"level":3,"use_inductor":true,"use_cudagraph":true,"cudagraph_capture_sizes":[32,24,16,8,4,2,1]}'}
+# SERVER3_COMPILATION_CONFIG=${SERVER3_COMPILATION_CONFIG:-'{"level":3,"use_inductor":true,"use_cudagraph":true,"cudagraph_capture_sizes":[8,4,2,1]}'}
+# SERVER4_COMPILATION_CONFIG=${SERVER4_COMPILATION_CONFIG:-'{"level":3,"use_inductor":true,"use_cudagraph":true,"cudagraph_capture_sizes":[2,1]}'}
+
+OWNER_COMPILATION_CONFIG=${OWNER_COMPILATION_CONFIG:-'{"level":3,"use_inductor":true,"use_cudagraph":true,"cudagraph_capture_sizes":[256,248,240,232,224,216,208,200,192,184,176,168,160,152,144,136,128,120,112,104,96,88,80,72,64,56,48,40,32,24,16,8,4,2,1]}'}
+# SERVER2_COMPILATION_CONFIG=${SERVER2_COMPILATION_CONFIG:-'{"level":3,"use_inductor":true,"use_cudagraph":true,"cudagraph_capture_sizes":[104,96,88,80,72,64,56,48,40,32,24,16,8,4,2,1]}'}
+# SERVER3_COMPILATION_CONFIG=${SERVER3_COMPILATION_CONFIG:-'{"level":3,"use_inductor":true,"use_cudagraph":true,"cudagraph_capture_sizes":[32,24,16,8,4,2,1]}'}
+SERVER2_COMPILATION_CONFIG='{"level":3,"use_inductor":true,"use_cudagraph":true}'
+SERVER3_COMPILATION_CONFIG='{"level":3,"use_inductor":true,"use_cudagraph":true}'
+SERVER4_COMPILATION_CONFIG=${SERVER4_COMPILATION_CONFIG:-'{"level":3,"use_inductor":true,"use_cudagraph":true,"cudagraph_capture_sizes":[1]}'}
+# SERVER4_COMPILATION_CONFIG='{"level":0,"use_inductor":false,"use_cudagraph":false}'
+
 if command -v rg >/dev/null 2>&1; then
   MATCH_BIN="rg"
 else
@@ -68,6 +82,11 @@ nohup /root/anaconda3/envs/verl/bin/python -m vllm.proxy_cluster.launch_four_ser
   --consumer-cuda-visible-devices-all 0,1 \
   --owner-tensor-parallel-size 2 \
   --consumer-tensor-parallel-size 2 \
+  --owner-compilation-config "$OWNER_COMPILATION_CONFIG" \
+  --no-consumer-enforce-eager \
+  --server2-compilation-config "$SERVER2_COMPILATION_CONFIG" \
+  --server3-compilation-config "$SERVER3_COMPILATION_CONFIG" \
+  --server4-compilation-config "$SERVER4_COMPILATION_CONFIG" \
   --consumer-attention-backend TORCH_SDPA \
   --kv-owner-state-url http://127.0.0.1:8300 \
   --kv-transfer-config-template '{"kv_connector":"CudaIpcConnector","kv_role":"kv_both","kv_rank":0,"kv_parallel_size":1}' \
