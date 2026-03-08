@@ -143,6 +143,9 @@ class CudaIpcConnector(KVConnectorBase_V1):
                                                   True))
         self._owner_batch_max_items = int(
             transfer_config.get_from_extra_config("owner_batch_max_items", 256))
+        self._owner_flush_each_layer = bool(
+            transfer_config.get_from_extra_config("owner_flush_each_layer",
+                                                  False))
         self._owner_register_batch: list[dict[str, Any]] = []
         self._owner_lookup_grace_s = float(
             transfer_config.get_from_extra_config("owner_lookup_grace_s", 2.0))
@@ -475,8 +478,8 @@ class CudaIpcConnector(KVConnectorBase_V1):
                 # Keep in-flight refs untouched in this path.
                 pass
         self._gc_inflight_exports()
-        # Flush every layer-call to reduce owner-state lag at hop boundaries.
-        self._owner_flush_register_kv()
+        if self._owner_flush_each_layer:
+            self._owner_flush_register_kv()
 
     def wait_for_save(self):
         self._owner_flush_register_kv()
@@ -752,6 +755,54 @@ class CudaIpcConnector(KVConnectorBase_V1):
                     pass
             time.sleep(self._ipc_poll_interval_s)
         return None
+
+    def should_save_kv_layer(self) -> bool:
+        """Fast path for attention hook to skip save-side work entirely.
+
+        This avoids entering per-layer export logic on producer/relay steps
+        before send-side handoff is actually activated.
+        """
+        if not self.can_send:
+            return False
+        if self._connector_metadata is None:
+            return False
+        metadata = self._get_connector_metadata()
+        assert isinstance(metadata, CudaIpcConnectorMetadata)
+        for request in metadata.requests:
+            if self._should_send_req(request.request_id):
+                return True
+        return False
+
+    def should_build_connector_meta(
+            self, scheduler_output: SchedulerOutput) -> bool:
+        if self.can_recv and self._requests_need_load:
+            return True
+        if not self.can_send:
+            return False
+
+        for new_req in scheduler_output.scheduled_new_reqs:
+            req_id = new_req.req_id
+            if not self.has_decode_addr(req_id):
+                continue
+            num_scheduled_tokens = (
+                scheduler_output.num_scheduled_tokens).get(req_id, 0)
+            num_tokens = int(num_scheduled_tokens + new_req.num_computed_tokens)
+            if self._should_send_req(req_id, num_tokens):
+                return True
+
+        cached_reqs = scheduler_output.scheduled_cached_reqs
+        for i, req_id in enumerate(cached_reqs.req_ids):
+            if not (self.has_decode_addr(req_id)
+                    or self.base_request_id(req_id) in self._send_enabled_bases):
+                continue
+            num_scheduled_tokens = (
+                scheduler_output.num_scheduled_tokens).get(req_id, 0)
+            total_tokens = int(cached_reqs.num_computed_tokens[i] +
+                               num_scheduled_tokens)
+            if self._should_send_req(req_id, total_tokens):
+                return True
+
+        return False
 
     def _gc_inflight_exports(self) -> None:
         if self._ipc_export_ttl_s <= 0:

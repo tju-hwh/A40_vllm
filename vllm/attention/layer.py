@@ -547,6 +547,9 @@ def maybe_save_kv_layer_to_connector(
         return
 
     connector = get_kv_transfer_group()
+    should_save = getattr(connector, "should_save_kv_layer", None)
+    if callable(should_save) and not should_save():
+        return
 
     forward_context: ForwardContext = get_forward_context()
     attn_metadata = forward_context.attn_metadata

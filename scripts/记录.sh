@@ -72,10 +72,44 @@ CONCURRENCY=128 \
 NUM_REQUESTS=128 \
 MAX_TOKENS=4096 \
 MAX_MODEL_LEN=4096 \
-CUTOVERS=1024,1024,1024 \
+CUTOVERS=1024,4096,4096 \
 KV_HANDOFF_SERIAL_BARRIER=1 \
 KV_HANDOFF_MIN_LAYERS=56 \
 KV_HANDOFF_SOFT_MIN_LAYERS=8 \
 KV_HANDOFF_WAIT_TIMEOUT_S=10 \
 KV_HANDOFF_STABLE_POLLS=1 \
 bash /root/vllm/scripts/test_handoff_conc10.sh
+
+
+mps:
+nvidia-cuda-mps-control -d
+echo "get_server_list" | nvidia-cuda-mps-control
+echo "quit" | nvidia-cuda-mps-control
+
+./vllm/scripts/clean.sh
+
+ENABLE_VERL_HOP=true \
+HOP_OWNER_TP_SIZE=2 \
+HOP_CONSUMER_TP_SIZE=2 \
+HOP_OWNER_CUDA_VISIBLE_DEVICES=0,1 \
+HOP_CONSUMER_CUDA_VISIBLE_DEVICES_ALL=0,1 \
+HOP_DECODE_CUTOVERS='[1024,1024,1024]' \
+HOP_ENABLE_CUDA_MPS=true \
+HOP_MPS_ACTIVE_THREAD_PERCENTAGES='[100,60,40,20]' \
+bash recipe/one_step_off_policy/shell/test_deepmath.sh
+
+
+ENABLE_VERL_HOP=true \
+HOP_OWNER_TP_SIZE=2 \
+HOP_CONSUMER_TP_SIZE=2 \
+HOP_OWNER_CUDA_VISIBLE_DEVICES=0,1 \
+HOP_CONSUMER_CUDA_VISIBLE_DEVICES_ALL=0,1 \
+bash /root/A40_verl/recipe/one_step_off_policy/shell/test_deepmath.sh
+
+
+
+rollout-only 测试入口
+ENABLE_VERL_HOP=true \
+HOP_ENABLE_CUDA_MPS=true \
+HOP_MPS_ACTIVE_THREAD_PERCENTAGES='[100,100]' \
+bash /root/A40_verl/recipe/one_step_off_policy/shell/test_deepmath_rollout_only.sh

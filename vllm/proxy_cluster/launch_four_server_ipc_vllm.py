@@ -166,6 +166,13 @@ def _parse_csv(raw: str) -> list[str]:
     return [x.strip() for x in raw.split(",") if x.strip()]
 
 
+def _parse_csv_ints(raw: str) -> list[int]:
+    vals: list[int] = []
+    for item in _parse_csv(raw):
+        vals.append(int(item))
+    return vals
+
+
 def _resolve_kv_transfer_config(raw: str | None,
                                 port: int,
                                 kv_owner_state_url: str = "",
@@ -173,7 +180,10 @@ def _resolve_kv_transfer_config(raw: str | None,
                                 shared_kv_pool_meta_path: str = "",
                                 shared_kv_pool_wait_timeout_s: float = 300.0,
                                 shared_kv_pool_poll_s: float = 0.1,
-                                shared_kv_pool_role: str = "") -> str | None:
+                                shared_kv_pool_role: str = "",
+                                send_activation_margin_tokens: int | None = None,
+                                send_publish_token_stride: int | None = None,
+                                owner_flush_each_layer: bool | None = None) -> str | None:
     if not raw:
         return None
     replaced = raw.replace("{port}", str(port))
@@ -209,6 +219,15 @@ def _resolve_kv_transfer_config(raw: str | None,
                          float(shared_kv_pool_wait_timeout_s))
         extra.setdefault("shared_kv_pool_poll_s",
                          float(shared_kv_pool_poll_s))
+    if connector == "CudaIpcConnector" and send_activation_margin_tokens is not None:
+        extra.setdefault("send_activation_margin_tokens",
+                         int(send_activation_margin_tokens))
+    if connector == "CudaIpcConnector" and send_publish_token_stride is not None:
+        extra.setdefault("send_publish_token_stride",
+                         int(send_publish_token_stride))
+    if connector == "CudaIpcConnector" and owner_flush_each_layer is not None:
+        extra.setdefault("owner_flush_each_layer",
+                         bool(owner_flush_each_layer))
     return json.dumps(obj, separators=(",", ":"))
 
 
@@ -231,10 +250,17 @@ def _read_dynamic_active_upstream(control_path: str) -> str | None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Launch 4 real vLLM servers with experimental CUDA IPC shared parameters."
+        description="Launch real vLLM servers with experimental CUDA IPC shared parameters."
     )
     parser.add_argument("--model", required=True)
     parser.add_argument("--host", default="0.0.0.0")
+    parser.add_argument(
+        "--num-servers",
+        type=int,
+        default=4,
+        choices=[2, 4],
+        help="Number of servers to launch: owner + 1 consumer, or owner + 3 consumers.",
+    )
     parser.add_argument("--server1-port", type=int, default=8101, help="Owner vLLM server port.")
     parser.add_argument("--server2-port", type=int, default=8102, help="Consumer vLLM server port.")
     parser.add_argument("--server3-port", type=int, default=8103, help="Consumer vLLM server port.")
@@ -357,6 +383,22 @@ def main() -> int:
         help="Set VLLM_ATTENTION_BACKEND for consumers (e.g. TORCH_SDPA/FLASHINFER/FLASH_ATTN).",
     )
     parser.add_argument(
+        "--enable-cuda-mps",
+        action="store_true",
+        help=(
+            "Set CUDA_MPS_ACTIVE_THREAD_PERCENTAGE per launched server process. "
+            "Requires an external CUDA MPS daemon to already be running."
+        ),
+    )
+    parser.add_argument(
+        "--mps-active-thread-percentages",
+        default="",
+        help=(
+            "CSV for server1..N MPS percentages, "
+            "for example '100,60' or '100,60,40,20'."
+        ),
+    )
+    parser.add_argument(
         "--owner-kv-transfer-config",
         default="",
         help=(
@@ -466,10 +508,34 @@ def main() -> int:
         default=0.1,
         help="Poll interval for shared KV pool metadata file.",
     )
+    parser.add_argument(
+        "--send-activation-margin-tokens",
+        type=int,
+        default=512,
+        help=(
+            "Producer-side connector activation margin. Smaller values keep "
+            "server1 on the native local decode path until closer to handoff."
+        ),
+    )
+    parser.add_argument(
+        "--send-publish-token-stride",
+        type=int,
+        default=64,
+        help="Producer-side KV publish stride after send path is activated.",
+    )
+    parser.add_argument(
+        "--owner-flush-each-layer",
+        action="store_true",
+        help=(
+            "Flush owner-state registration every attention layer. Disabled by "
+            "default to keep active decode closer to native vLLM."
+        ),
+    )
     args, vllm_extra = parser.parse_known_args()
 
     host = args.host
-    ports = [args.server1_port, args.server2_port, args.server3_port, args.server4_port]
+    all_ports = [args.server1_port, args.server2_port, args.server3_port, args.server4_port]
+    ports = all_ports[: args.num_servers]
     urls = [f"http://127.0.0.1:{p}" for p in ports]
 
     try:
@@ -479,6 +545,18 @@ def main() -> int:
 
     children: list[subprocess.Popen] = []
     base_env = dict(os.environ)
+    mps_percentages = _parse_csv_ints(args.mps_active_thread_percentages)
+    if args.enable_cuda_mps:
+        if len(mps_percentages) != args.num_servers:
+            raise ValueError(
+                "--enable-cuda-mps requires --mps-active-thread-percentages "
+                f"with exactly {args.num_servers} comma-separated integers"
+            )
+        for pct in mps_percentages:
+            if pct <= 0 or pct > 100:
+                raise ValueError(
+                    "MPS active thread percentages must be in the range 1..100"
+                )
 
     def _sig_handler(signum, frame):  # type: ignore[no-untyped-def]
         _stop_all(children)
@@ -519,11 +597,16 @@ def main() -> int:
             args.shared_kv_pool_wait_timeout_s,
             args.shared_kv_pool_poll_s,
             "producer",
+            args.send_activation_margin_tokens,
+            args.send_publish_token_stride,
+            args.owner_flush_each_layer,
         ),
     )
     owner_env = dict(base_env)
     if args.owner_cuda_visible_devices:
         owner_env["CUDA_VISIBLE_DEVICES"] = args.owner_cuda_visible_devices
+    if args.enable_cuda_mps:
+        owner_env["CUDA_MPS_ACTIVE_THREAD_PERCENTAGE"] = str(mps_percentages[0])
     if args.shared_kv_pool_enable:
         owner_env["VLLM_SHARED_BLOCK_ALLOCATOR_ENABLE"] = "1"
         owner_env["VLLM_SHARED_BLOCK_ALLOCATOR_PATH"] = (
@@ -540,7 +623,7 @@ def main() -> int:
         return 1
 
     consumer_visible_devices = _parse_csv(args.consumer_cuda_visible_devices)
-    consumer_ports = [args.server2_port, args.server3_port, args.server4_port]
+    consumer_ports = ports[1:]
     consumer_extra = _strip_overridden_args(
         vllm_extra,
         {
@@ -559,6 +642,10 @@ def main() -> int:
             env["CUDA_VISIBLE_DEVICES"] = args.consumer_cuda_visible_devices_all
         elif idx < len(consumer_visible_devices):
             env["CUDA_VISIBLE_DEVICES"] = consumer_visible_devices[idx]
+        if args.enable_cuda_mps:
+            env["CUDA_MPS_ACTIVE_THREAD_PERCENTAGE"] = str(
+                mps_percentages[idx + 1]
+            )
         if args.consumer_attention_backend:
             env["VLLM_ATTENTION_BACKEND"] = args.consumer_attention_backend
         if args.shared_kv_pool_enable:
@@ -603,10 +690,13 @@ def main() -> int:
                 args.shared_kv_pool_wait_timeout_s,
                 args.shared_kv_pool_poll_s,
                 "consumer",
+                args.send_activation_margin_tokens,
+                args.send_publish_token_stride,
+                args.owner_flush_each_layer,
             ),
         )
 
-    # child slots: 0=owner, 1..3=consumers 2..4
+    # child slots: 0=owner, 1..N-1=consumers
     consumer_active_profile: dict[int, bool] = {}
     for idx, p in enumerate(consumer_ports):
         use_active = False
@@ -615,12 +705,13 @@ def main() -> int:
 
     dynamic_active_upstream: str | None = None
 
+    server_lines = "".join(
+        f"  server-{idx + 1} ({'owner' if idx == 0 else 'consumer'}): {url}\n"
+        for idx, url in enumerate(urls)
+    )
     print(
-        "\nStarted 4 vLLM servers (experimental ipc_weight_share):\n"
-        f"  server-1 (owner):    {urls[0]}\n"
-        f"  server-2 (consumer): {urls[1]}\n"
-        f"  server-3 (consumer): {urls[2]}\n"
-        f"  server-4 (consumer): {urls[3]}\n"
+        f"\nStarted {args.num_servers} vLLM servers (experimental ipc_weight_share):\n"
+        f"{server_lines}"
         f"IPC meta file: {args.ipc_meta_path}\n"
     )
     print("Press Ctrl+C to stop all.")

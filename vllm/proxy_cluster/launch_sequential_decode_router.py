@@ -53,10 +53,17 @@ def _wait_upstreams_ready(targets: list[str], timeout_s: float) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Launch a decode router with sequential block policy for 4 pre-started vLLM servers."
+        description="Launch a decode router with sequential block policy for pre-started vLLM servers."
     )
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8200, help="Ingress router port.")
+    parser.add_argument(
+        "--num-servers",
+        type=int,
+        default=4,
+        choices=[2, 4],
+        help="Number of upstream servers to use in sequential routing.",
+    )
     parser.add_argument("--server1-url", default="http://127.0.0.1:8101")
     parser.add_argument("--server2-url", default="http://127.0.0.1:8102")
     parser.add_argument("--server3-url", default="http://127.0.0.1:8103")
@@ -64,7 +71,7 @@ def main() -> int:
     parser.add_argument(
         "--server-kv-ports",
         default="18101,18102,18103,18104",
-        help="Comma-separated KV connector ports aligned with server1..server4 URLs.",
+        help="Comma-separated KV connector ports aligned with enabled server URLs.",
     )
     parser.add_argument(
         "--routing-mode",
@@ -76,7 +83,7 @@ def main() -> int:
     parser.add_argument(
         "--decode-cutovers",
         default="1000,1000,1000",
-        help="For sequential_handoff mode: decode token cutovers across server1/2/3, remaining on server4.",
+        help="For sequential_handoff mode: decode token cutovers before moving to next server.",
     )
     parser.add_argument("--request-timeout-s", type=float, default=300.0)
     parser.add_argument("--connect-timeout-s", type=float, default=30.0)
@@ -150,23 +157,17 @@ def main() -> int:
     env = dict(os.environ)
     env["PROXY_ROLE"] = "ingress"
     env["PRIMARY_UPSTREAM"] = args.server1_url.rstrip("/")
-    env["ALT_UPSTREAMS"] = ",".join(
-        [
-            args.server2_url.rstrip("/"),
-            args.server3_url.rstrip("/"),
-            args.server4_url.rstrip("/"),
-        ]
-    )
+    all_targets = [
+        args.server1_url.rstrip("/"),
+        args.server2_url.rstrip("/"),
+        args.server3_url.rstrip("/"),
+        args.server4_url.rstrip("/"),
+    ]
+    active_targets = all_targets[: args.num_servers]
+    env["ALT_UPSTREAMS"] = ",".join(active_targets[1:])
     env["ROUTING_MODE"] = args.routing_mode
     env["SEQUENTIAL_BLOCK_SIZE"] = str(args.block_size)
-    env["SEQUENTIAL_TARGETS"] = ",".join(
-        [
-            args.server1_url.rstrip("/"),
-            args.server2_url.rstrip("/"),
-            args.server3_url.rstrip("/"),
-            args.server4_url.rstrip("/"),
-        ]
-    )
+    env["SEQUENTIAL_TARGETS"] = ",".join(active_targets)
     env["SEQUENTIAL_TARGET_KV_PORTS"] = args.server_kv_ports
     env["SEQUENTIAL_DECODE_TOKENS"] = args.decode_cutovers
     env["REQUEST_TIMEOUT_S"] = str(args.request_timeout_s)
@@ -181,12 +182,7 @@ def main() -> int:
     env["KV_OWNER_STATE_URL"] = args.kv_owner_state_url
     env["KV_OWNER_STATE_STRICT"] = "1" if args.kv_owner_state_strict else "0"
 
-    upstreams = [
-        args.server1_url.rstrip("/"),
-        args.server2_url.rstrip("/"),
-        args.server3_url.rstrip("/"),
-        args.server4_url.rstrip("/"),
-    ]
+    upstreams = active_targets
     if not args.skip_wait_upstreams_ready:
         _wait_upstreams_ready(upstreams, args.wait_upstreams_ready_timeout_s)
     else:
@@ -222,12 +218,12 @@ def main() -> int:
         f"  upstream max model len: {args.upstream_max_model_len}\n"
         f"  dynamic kv control path: {args.dynamic_kv_control_path or '(disabled)'}\n"
         f"  kv owner state url: {args.kv_owner_state_url or '(disabled)'}\n"
-        f"  targets: {args.server1_url}, {args.server2_url}, {args.server3_url}, {args.server4_url}\n"
+        f"  targets: {', '.join(active_targets)}\n"
     )
     if args.routing_mode == "sequential_blocks":
-        print("Policy: decode requests 1-128->server1, 129-256->server2, 257-384->server3, 385+->server4.")
+        print(f"Policy: decode requests are assigned across {args.num_servers} servers in sequential blocks.")
     else:
-        print("Policy: single request is chained by decode tokens: server1->server2->server3->server4.")
+        print(f"Policy: single request is chained by decode tokens across {args.num_servers} servers.")
     print("Press Ctrl+C to stop.")
 
     while True:

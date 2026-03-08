@@ -35,7 +35,8 @@ class KVConnectorModelRunnerMixin:
         if has_kv_transfer_group():
             kv_connector = get_kv_transfer_group()
             assert isinstance(kv_connector, KVConnectorBase)
-            assert scheduler_output.kv_connector_metadata is not None
+            if scheduler_output.kv_connector_metadata is None:
+                return
             kv_connector.bind_connector_metadata(
                 scheduler_output.kv_connector_metadata)
 
@@ -103,7 +104,15 @@ class KVConnectorModelRunnerMixin:
         # Update KVConnector with the KVConnector metadata forward().
         kv_connector = get_kv_transfer_group()
         assert isinstance(kv_connector, KVConnectorBase)
-        assert scheduler_output.kv_connector_metadata is not None
+        if scheduler_output.kv_connector_metadata is None:
+            try:
+                yield output
+            finally:
+                output.finished_sending, output.finished_recving = (
+                    kv_connector.get_finished(scheduler_output.finished_req_ids))
+                output.kv_connector_stats = KVConnectorModelRunnerMixin.\
+                get_kv_connector_stats()
+            return
         kv_connector.bind_connector_metadata(
             scheduler_output.kv_connector_metadata)
 

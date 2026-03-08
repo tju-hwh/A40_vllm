@@ -117,6 +117,11 @@ def _get_shared_kv_pool_num_blocks(vllm_config: VllmConfig,
                 payload = pickle.load(f)
             if not isinstance(payload, dict) or not payload:
                 continue
+            global_rec = payload.get("__global__")
+            if isinstance(global_rec, dict):
+                num_gpu_blocks = global_rec.get("num_gpu_blocks")
+                if isinstance(num_gpu_blocks, int) and num_gpu_blocks > 0:
+                    return int(num_gpu_blocks)
             blocks: list[int] = []
             for rec in payload.values():
                 if isinstance(rec, dict):

@@ -3846,6 +3846,9 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 }
 
         if self._shared_kv_pool_enable and self._shared_kv_pool_is_producer:
+            shared_payload["__global__"] = {
+                "num_gpu_blocks": int(kv_cache_config.num_blocks),
+            }
             self._dump_shared_kv_pool_meta(shared_payload)
             logger.info("shared_kv_pool producer exported groups=%d path=%s",
                         len(shared_payload), self._shared_kv_pool_meta_path)

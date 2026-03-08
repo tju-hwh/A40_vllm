@@ -119,6 +119,17 @@ class KVConnectorBase_V1(ABC):
         """
         self._connector_metadata = None
 
+    def should_build_connector_meta(self, scheduler_output: "SchedulerOutput"
+                                    ) -> bool:
+        """Return whether this step needs connector metadata at all.
+
+        Default behavior preserves the existing connector lifecycle.
+        Specialized connectors can override this to skip all worker-side
+        connector setup on steps with no send/recv work.
+        """
+        del scheduler_output
+        return True
+
     def _get_connector_metadata(self) -> KVConnectorMetadata:
         """Get the connector metadata.
 

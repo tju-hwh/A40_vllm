@@ -499,10 +499,15 @@ async def _handle_completion_sequential_handoff(
             content={"error": "stream=true is not supported in sequential_handoff mode"},
         )
     prompt = req_obj.get("prompt")
-    if not isinstance(prompt, str):
+    prompt_is_text = isinstance(prompt, str)
+    prompt_is_token_ids = (
+        isinstance(prompt, list)
+        and all(isinstance(tok, int) for tok in prompt)
+    )
+    if not prompt_is_text and not prompt_is_token_ids:
         return JSONResponse(
             status_code=400,
-            content={"error": "sequential_handoff currently supports string prompt only"},
+            content={"error": "sequential_handoff requires prompt as string or list[int]"},
         )
 
     total_max_tokens = int(req_obj.get("max_tokens", 16))
@@ -585,7 +590,22 @@ async def _handle_completion_sequential_handoff(
             hop_req["prompt"] = cumulative_prompt_token_ids
         else:
             # Fallback path when upstream did not return token IDs.
-            hop_req["prompt"] = base_prompt + generated_text
+            if isinstance(base_prompt, str):
+                hop_req["prompt"] = base_prompt + generated_text
+            else:
+                return JSONResponse(
+                    status_code=502,
+                    content={
+                        "error": "missing_token_history_for_token_prompt",
+                        "detail": (
+                            "Upstream did not return cumulative token ids, "
+                            "cannot continue handoff from token-id prompt."
+                        ),
+                        "upstream": target_base,
+                        "hop": hop_idx,
+                        "decode_idx": decode_idx,
+                    },
+                )
         # Guard against per-hop context overflow:
         # input_tokens + max_tokens must not exceed upstream max_model_len.
         effective_hop_max_tokens = int(hop_max_tokens)
