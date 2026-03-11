@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import logging
 import time
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from fastapi import FastAPI
 from pydantic import BaseModel
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -16,6 +20,9 @@ class RequestState:
     committed_tokens: int = 0
     last_hop: int = 0
     updated_at: float = field(default_factory=time.time)
+    publish_done_hop: int = 0
+    load_ack_hop: int = 0
+    resume_hop: int = 0
     # layer_name -> KV export metadata
     kv_by_layer: dict[str, dict[str, Any]] = field(default_factory=dict)
 
@@ -63,6 +70,24 @@ class ResetReq(BaseModel):
 
 class RegisterKVBatchReq(BaseModel):
     items: list[RegisterKVReq]
+
+
+class PublishDoneReq(BaseModel):
+    request_id: str
+    worker: str
+    hop: int
+
+
+class LoadAckReq(BaseModel):
+    request_id: str
+    worker: str
+    hop: int
+
+
+class ResumeReq(BaseModel):
+    request_id: str
+    worker: str
+    hop: int
 
 
 def create_app() -> FastAPI:
@@ -186,6 +211,50 @@ def create_app() -> FastAPI:
             await register_kv(item)
         return {"ok": True, "count": len(req.items)}
 
+    @app.post("/publish_done")
+    async def publish_done(req: PublishDoneReq) -> dict[str, Any]:
+        rid = _canonical_request_id(req.request_id)
+        st = states.get(rid)
+        if st is None:
+            st = RequestState(request_id=rid)
+            states[rid] = st
+        st.publish_done_hop = max(int(st.publish_done_hop), int(req.hop))
+        st.updated_at = time.time()
+        logger.info("publish_done req=%s worker=%s hop=%s", rid, req.worker,
+                    req.hop)
+        return {"ok": True, "publish_done_hop": st.publish_done_hop}
+
+    @app.post("/load_ack")
+    async def load_ack(req: LoadAckReq) -> dict[str, Any]:
+        rid = _canonical_request_id(req.request_id)
+        st = states.get(rid)
+        if st is None:
+            st = RequestState(request_id=rid)
+            states[rid] = st
+        st.load_ack_hop = max(int(st.load_ack_hop), int(req.hop))
+        st.resume_hop = max(int(st.resume_hop), int(req.hop))
+        st.updated_at = time.time()
+        logger.info("load_ack req=%s worker=%s hop=%s", rid, req.worker,
+                    req.hop)
+        return {
+            "ok": True,
+            "load_ack_hop": st.load_ack_hop,
+            "resume_hop": st.resume_hop,
+        }
+
+    @app.post("/resume")
+    async def resume(req: ResumeReq) -> dict[str, Any]:
+        rid = _canonical_request_id(req.request_id)
+        st = states.get(rid)
+        if st is None:
+            st = RequestState(request_id=rid)
+            states[rid] = st
+        st.resume_hop = max(int(st.resume_hop), int(req.hop))
+        st.updated_at = time.time()
+        logger.info("resume req=%s worker=%s hop=%s", rid, req.worker,
+                    req.hop)
+        return {"ok": True, "resume_hop": st.resume_hop}
+
     @app.post("/lookup_kv")
     async def lookup_kv(req: LookupKVReq) -> dict[str, Any]:
         rid = _canonical_request_id(req.request_id)
@@ -213,6 +282,9 @@ def create_app() -> FastAPI:
             "epoch": st.epoch,
             "committed_tokens": st.committed_tokens,
             "last_hop": st.last_hop,
+            "publish_done_hop": st.publish_done_hop,
+            "load_ack_hop": st.load_ack_hop,
+            "resume_hop": st.resume_hop,
             "num_kv_layers": len(st.kv_by_layer),
             "updated_at": st.updated_at,
         }

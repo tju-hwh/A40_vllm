@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from __future__ import annotations
 
+import glob
 import hashlib
 import json
 import os
@@ -105,6 +106,8 @@ class CudaIpcConnector(KVConnectorBase_V1):
             transfer_config.get_from_extra_config("kv_owner_state_url", "")).strip()
         self._kv_owner_state_timeout_s = float(
             transfer_config.get_from_extra_config("kv_owner_state_timeout_s", 1.0))
+        self._resume_wait_timeout_s = float(
+            transfer_config.get_from_extra_config("resume_wait_timeout_s", 30.0))
         self._shared_block_table_enable = bool(
             transfer_config.get_from_extra_config("shared_block_table_enable",
                                                   False))
@@ -156,10 +159,49 @@ class CudaIpcConnector(KVConnectorBase_V1):
         self._handoff_pin_s = float(
             transfer_config.get_from_extra_config("handoff_pin_s", 1.5))
         self._deferred_finished_until: dict[str, float] = {}
+        self._global_tensor_map_cache: Optional[dict[str, str]] = None
 
     # ==============================
     # Worker-side methods
     # ==============================
+
+    def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
+        if not (self.can_send and self._zero_copy_shared_pool_mode):
+            return
+
+        def _device_tag(layer: torch.Tensor) -> str:
+            if layer.is_cuda:
+                idx = layer.device.index
+                if idx is None:
+                    idx = torch.cuda.current_device()
+                return f"cuda{int(idx)}"
+            return str(layer.device).replace(":", "_")
+
+        payload: dict[str, str] = {}
+        for layer_name, kv_cache in kv_caches.items():
+            if not kv_cache.is_cuda:
+                continue
+            layer_key = f"{layer_name}@{_device_tag(kv_cache)}"
+            tensor_key = f"__global__#{layer_key}"
+            meta_path = self._meta_file_path(tensor_key)
+            if not os.path.exists(meta_path):
+                self._write_tensor_meta(
+                    tensor_key,
+                    export_cuda_tensor_meta(kv_cache),
+                    num_tokens=0,
+                    num_blocks=0,
+                )
+            payload[layer_key] = tensor_key
+
+        if not payload:
+            return
+
+        map_path = self._global_tensor_map_path()
+        tmp_path = f"{map_path}.tmp.{os.getpid()}"
+        with open(tmp_path, "wb") as f:
+            pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
+        os.replace(tmp_path, map_path)
+        self._global_tensor_map_cache = payload.copy()
 
     def start_load_kv(self, forward_context: "ForwardContext",
                       **kwargs: Any) -> None:
@@ -175,6 +217,29 @@ class CudaIpcConnector(KVConnectorBase_V1):
 
         metadata: KVConnectorMetadata = self._get_connector_metadata()
         assert isinstance(metadata, CudaIpcConnectorMetadata)
+        global_tensor_map = (self._load_global_tensor_map()
+                             if self._zero_copy_shared_pool_mode else {})
+
+        if self._zero_copy_shared_pool_mode:
+            for request in metadata.requests:
+                req_id = request.request_id
+                if not self.has_prefill_addr(req_id):
+                    continue
+                req_norm = self.normalize_request_id(req_id)
+                if req_norm in self._recv_loaded_once:
+                    continue
+                base_req = self.base_request_id(req_id)
+                logger.info(
+                    "cuda_ipc zero-copy handoff req=%s; posting load_ack without tensor rebuild",
+                    base_req)
+                self._owner_load_ack(
+                    request_id=base_req,
+                    worker=self._decode_worker_from_req(req_id),
+                    hop=1,
+                )
+                self._recv_loaded_once.add(req_norm)
+            self._gc_inflight_exports()
+            return
 
         def _device_tag(layer: torch.Tensor) -> str:
             if layer.is_cuda:
@@ -237,7 +302,8 @@ class CudaIpcConnector(KVConnectorBase_V1):
                 layer_kv = kv_cache_attr[forward_context.virtual_engine]
 
                 layer_key = f"{layer_name}@{_device_tag(layer_kv)}"
-                tensor_key = f"{base_req}#{layer_key}"
+                tensor_key = global_tensor_map.get(
+                    layer_key, f"{base_req}#{layer_key}")
                 expected_blocks = min(
                     len(request.block_ids),
                     (request.num_tokens + self._block_size - 1) // self._block_size,
@@ -292,9 +358,15 @@ class CudaIpcConnector(KVConnectorBase_V1):
                                     src_block_ids = request.block_ids[
                                         :expected_blocks]
                     else:
-                        logger.warning(
-                            "cuda_ipc owner lookup miss req=%s layer=%s fallback=local_key",
-                            base_req, layer_key)
+                        if self._zero_copy_shared_pool_mode:
+                            if layer_key not in global_tensor_map:
+                                logger.warning(
+                                    "cuda_ipc owner lookup miss req=%s layer=%s fallback=no_global_key",
+                                    base_req, layer_key)
+                        else:
+                            logger.warning(
+                                "cuda_ipc owner lookup miss req=%s layer=%s fallback=local_key",
+                                base_req, layer_key)
                 elif rec and isinstance(rec.get("tensor_key"), str):
                     tensor_key = str(rec["tensor_key"])
                 # Re-slice destination after any expected_blocks adjustment.
@@ -342,15 +414,35 @@ class CudaIpcConnector(KVConnectorBase_V1):
             # In relay path, repeatedly re-loading the same request is costly.
             # Mark as loaded once we successfully injected at least one layer.
             if loaded_layers > 0 and not load_errors:
+                logger.info(
+                    "cuda_ipc load complete req=%s loaded_layers=%d; posting load_ack",
+                    base_req, loaded_layers)
+                self._owner_load_ack(
+                    request_id=base_req,
+                    worker=self._decode_worker_from_req(req_id),
+                    hop=1,
+                )
+                self._wait_resume(request_id=base_req, hop=1)
                 self._recv_loaded_once.add(req_norm)
         self._gc_inflight_exports()
 
     def _should_send_req(self,
                          request_id: str,
                          total_tokens: Optional[int] = None) -> bool:
-        if self.has_decode_addr(request_id):
+        base_req = self.base_request_id(request_id)
+        if base_req in self._send_enabled_bases:
             return True
-        return self.base_request_id(request_id) in self._send_enabled_bases
+        if not self.has_decode_addr(request_id):
+            return False
+        if total_tokens is None:
+            return False
+        activate = self._send_activation_tokens.get(request_id)
+        if activate is None:
+            return False
+        if int(total_tokens) >= int(activate):
+            self._send_enabled_bases.add(base_req)
+            return True
+        return False
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         del layer_name
@@ -431,6 +523,17 @@ class CudaIpcConnector(KVConnectorBase_V1):
                 int(x) for x in used_block_ids[:exported_blocks].tolist()
             ]
             publish_key = (base_req, layer_key)
+            last_pub = self._last_published.get(publish_key)
+            if last_pub is not None:
+                last_tokens, last_blocks = last_pub
+                if (int(request.num_tokens) <= int(last_tokens)
+                        and int(exported_blocks) <= int(last_blocks)):
+                    continue
+                if (self._send_publish_token_stride > 0
+                        and int(request.num_tokens) < int(last_tokens) +
+                        int(self._send_publish_token_stride)
+                        and int(exported_blocks) <= int(last_blocks)):
+                    continue
             wrote_meta = False
             meta_path = self._meta_file_path(tensor_key)
             if self._zero_copy_shared_pool_mode and os.path.exists(meta_path):
@@ -489,8 +592,10 @@ class CudaIpcConnector(KVConnectorBase_V1):
             self, finished_req_ids: set[str],
             **kwargs: Any) -> tuple[Optional[set[str]], Optional[set[str]]]:
         del kwargs
-        # Do not eagerly free exports on producer request finish.
-        # Consumer may still be importing CUDA IPC handles shortly after.
+        # Only report producer-side async sends that have actually matured.
+        # Ordinary completed requests must not be surfaced as
+        # "finished_sending", otherwise the scheduler treats consumer-side
+        # completions as KV-transfer callbacks and logs spurious warnings.
         now = time.time()
         done_send: set[str] = set()
         for req_id in finished_req_ids:
@@ -499,7 +604,7 @@ class CudaIpcConnector(KVConnectorBase_V1):
                 self._deferred_finished_until.setdefault(
                     req_id, now + self._handoff_pin_s)
             else:
-                done_send.add(req_id)
+                pass
         matured = {
             req_id
             for req_id, due in list(self._deferred_finished_until.items())
@@ -651,13 +756,44 @@ class CudaIpcConnector(KVConnectorBase_V1):
         request: "Request",
         block_ids: list[int],
     ) -> tuple[bool, Optional[dict[str, Any]]]:
-        del block_ids
+        if (self.can_send and self._zero_copy_shared_pool_mode
+                and self.has_decode_addr(request.request_id)):
+            total_tokens = len(getattr(request, "all_token_ids", []))
+            base_req = self.base_request_id(request.request_id)
+            global_tensor_map = self._load_global_tensor_map()
+            exported_blocks = len(block_ids)
+            exported_block_ids = [int(x) for x in block_ids]
+            for layer_key, tensor_key in global_tensor_map.items():
+                self._owner_register_kv(
+                    request_id=base_req,
+                    worker=self._decode_worker_from_req(request.request_id),
+                    hop=0,
+                    layer_name=layer_key,
+                    tensor_key=tensor_key,
+                    num_tokens=total_tokens,
+                    num_blocks=exported_blocks,
+                    block_ids=exported_block_ids,
+                )
+            self._owner_flush_register_kv()
+            logger.info(
+                "cuda_ipc publish_done req=%s tokens=%d blocks=%d layers=%d",
+                base_req, total_tokens, exported_blocks,
+                len(global_tensor_map))
+            self._owner_publish_done(
+                request_id=base_req,
+                worker=self._decode_worker_from_req(request.request_id),
+                hop=1,
+            )
         self.chunked_prefill.pop(request.request_id, None)
         self._send_req_blocks.pop(request.request_id, None)
         self._send_activation_tokens.pop(request.request_id, None)
         req_norm = self.normalize_request_id(request.request_id)
-        self._recv_loaded_once.discard(req_norm)
-        self._send_enabled_bases.discard(self.base_request_id(request.request_id))
+        if not self.can_recv:
+            self._recv_loaded_once.discard(req_norm)
+        base_req = self.base_request_id(request.request_id)
+        self._send_enabled_bases.discard(base_req)
+        for key in [k for k in self._last_published if k[0] == base_req]:
+            self._last_published.pop(key, None)
         # For handoff requests on producer side, delay block free briefly.
         should_delay_free = (
             self.can_send and self.has_decode_addr(request.request_id)
@@ -762,6 +898,8 @@ class CudaIpcConnector(KVConnectorBase_V1):
         This avoids entering per-layer export logic on producer/relay steps
         before send-side handoff is actually activated.
         """
+        if self._zero_copy_shared_pool_mode and self.can_send:
+            return False
         if not self.can_send:
             return False
         if self._connector_metadata is None:
@@ -777,6 +915,8 @@ class CudaIpcConnector(KVConnectorBase_V1):
             self, scheduler_output: SchedulerOutput) -> bool:
         if self.can_recv and self._requests_need_load:
             return True
+        if self._zero_copy_shared_pool_mode and self.can_send and not self.can_recv:
+            return False
         if not self.can_send:
             return False
 
@@ -825,6 +965,29 @@ class CudaIpcConnector(KVConnectorBase_V1):
             return f"http://{m.group(1)}:{m.group(2)}"
         return ""
 
+    def _global_tensor_map_path(self) -> str:
+        return os.path.join(self._ipc_meta_dir, "global_layer_map.pkl")
+
+    def _load_global_tensor_map(self) -> dict[str, str]:
+        if self._global_tensor_map_cache is not None:
+            return self._global_tensor_map_cache
+
+        merged: dict[str, str] = {}
+        for path in sorted(
+                glob.glob(
+                    os.path.join(self._ipc_meta_dir, "global_layer_map*.pkl"))):
+            try:
+                with open(path, "rb") as f:
+                    obj = pickle.load(f)
+                if isinstance(obj, dict):
+                    for k, v in obj.items():
+                        if isinstance(k, str) and isinstance(v, str):
+                            merged[k] = v
+            except Exception:
+                continue
+        self._global_tensor_map_cache = merged
+        return merged
+
     def _owner_post_json(self, path: str,
                          payload: dict[str, Any]) -> Optional[dict[str, Any]]:
         if not self._kv_owner_state_url:
@@ -845,9 +1008,79 @@ class CudaIpcConnector(KVConnectorBase_V1):
                 obj = json.loads(body.decode("utf-8"))
                 if isinstance(obj, dict):
                     return obj
-        except (urllib.error.URLError, TimeoutError, ValueError):
+        except (urllib.error.URLError, TimeoutError, ValueError, OSError):
             return None
-        return None
+
+    def _owner_publish_done(self, request_id: str, worker: str,
+                            hop: int) -> None:
+        self._owner_post_json(
+            "/publish_done",
+            {
+                "request_id": request_id,
+                "worker": worker,
+                "hop": int(hop),
+            },
+        )
+
+    def _owner_load_ack(self, request_id: str, worker: str, hop: int) -> None:
+        self._owner_post_json(
+            "/load_ack",
+            {
+                "request_id": request_id,
+                "worker": worker,
+                "hop": int(hop),
+            },
+        )
+
+    def _wait_resume(self, request_id: str, hop: int) -> None:
+        if not self._kv_owner_state_url:
+            return
+        if self._zero_copy_shared_pool_mode:
+            return
+        deadline = time.time() + self._resume_wait_timeout_s
+        url = self._kv_owner_state_url.rstrip("/") + f"/state/{request_id}"
+        logger.info("cuda_ipc wait resume req=%s hop>=%s timeout=%.1fs",
+                    request_id, hop, self._resume_wait_timeout_s)
+        last_obj: Optional[dict[str, Any]] = None
+        while time.time() < deadline:
+            try:
+                with urllib.request.urlopen(
+                        url, timeout=self._kv_owner_state_timeout_s) as resp:
+                    body = resp.read()
+                obj = json.loads(body.decode("utf-8")) if body else {}
+                if isinstance(obj, dict):
+                    last_obj = obj
+                if (isinstance(obj, dict) and bool(obj.get("ok", False))
+                        and int(obj.get("resume_hop", 0)) >= int(hop)):
+                    logger.info("cuda_ipc resume satisfied req=%s state=%s",
+                                request_id, obj)
+                    return
+                if (self._zero_copy_shared_pool_mode
+                        and isinstance(obj, dict)
+                        and bool(obj.get("ok", False))
+                        and int(obj.get("publish_done_hop", 0)) >= int(hop)
+                        and int(obj.get("load_ack_hop", 0)) >= int(hop)):
+                    try:
+                        self._owner_post_json(
+                            "/resume",
+                            {
+                                "request_id": request_id,
+                                "worker": self._local_worker_addr,
+                                "hop": int(hop),
+                            },
+                        )
+                    except Exception:
+                        pass
+                    logger.warning(
+                        "cuda_ipc resume missing; auto-continue req=%s hop=%s state=%s",
+                        request_id, hop, obj)
+                    return
+            except Exception:
+                pass
+            time.sleep(self._ipc_poll_interval_s)
+        raise RuntimeError(
+            f"cuda_ipc resume timeout req={request_id} hop={hop} state={last_obj}"
+        )
 
     def _owner_register_kv(
         self,

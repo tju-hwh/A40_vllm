@@ -113,3 +113,39 @@ ENABLE_VERL_HOP=true \
 HOP_ENABLE_CUDA_MPS=true \
 HOP_MPS_ACTIVE_THREAD_PERCENTAGES='[100,100]' \
 bash /root/A40_verl/recipe/one_step_off_policy/shell/test_deepmath_rollout_only.sh
+
+ENABLE_VERL_HOP=true \
+HOP_ENABLE_CUDA_MPS=true \
+HOP_MPS_ACTIVE_THREAD_PERCENTAGES='[100,100]' \
+bash /root/A40_verl/recipe/one_step_off_policy/shell/test_deepmath_rollout_only.sh
+
+ENABLE_VERL_HOP=true \
+HOP_OWNER_TP_SIZE=4 \
+HOP_CONSUMER_TP_SIZE=4 \
+HOP_OWNER_CUDA_VISIBLE_DEVICES='0,1,2,3' \
+HOP_CONSUMER_CUDA_VISIBLE_DEVICES_ALL='0,1,2,3' \
+bash /root/A40_verl/recipe/one_step_off_policy/shell/test_deepmath_4gpu.sh
+
+  从：
+
+  HOP_CONSUMER_ATTENTION_BACKEND=${HOP_CONSUMER_ATTENTION_BACKEND:-"TORCH_SDPA"}
+
+  改成：
+
+  HOP_CONSUMER_ATTENTION_BACKEND=${HOP_CONSUMER_ATTENTION_BACKEND:-"FLASH_ATTN"}
+
+
+
+
+RID="tp2-$(date +%s)-$RANDOM"
+OUT="/tmp/${RID}.json"
+PROMPT='逐个城市介绍，分别详细介绍北京、上海、洛阳、西安的历史和吃喝玩乐,每个城市介绍至少38000字，当你全部介绍完后，求解这道数学题设有一个函数，它等于自然对数函数ln作用在1加上sin x上的结果，再乘以指数函数e的x的平方次幂。现在要求研究这个函数在x等于0附近的性质。请将该函数在x
+等于0处进行六阶泰勒展开，也就是说，把它展开成一个关于x的多项式形式，一直到x的六次幂为止，并且写出每一项的系数。同时需要说明当x趋近于0时，高于六次幂的项统一用小o的x的六次方来表示。在完成展开之后，再利用得到的展开式计算下面的极限：当x趋近于0时，用该函数减去x，再除以x的平方，求这个极限的值。请给出完整的推导过程。'
+
+jq -n --arg model "/root/model/Qwen2-7B-Instruct" --arg request_id "$RID" --arg prompt "$PROMPT" '{"model":$model,"request_id":$request_id,"prompt":$prompt,"max_tokens":4096,"temperature":0.6,"top_p":1.0,"stop":[]}' | curl -sS --max-time 420 http://127.0.0.1:8200/v1/completions -H 'Content-Type: application/json' --data-binary @- > "$OUT"; echo "$OUT"
+
+
+curl -fsS http://127.0.0.1:8200/__proxy_state
+
+
+NGPUS_PER_NODE=2 n_gpus_rollout=2 n_gpus_training=2 HOP_OWNER_TP_SIZE=2 HOP_CONSUMER_TP_SIZE=2 HOP_OWNER_CUDA_VISIBLE_DEVICES='0,1' HOP_CONSUMER_CUDA_VISIBLE_DEVICES_ALL='0,1' HOP_OWNER_GPU_MEM_UTIL=0.28 HOP_CONSUMER_GPU_MEM_UTIL=0.28 HOP_DECODE_CUTOVERS='[1024]' bash /root/A40_verl/recipe/one_step_off_policy/shell/test_deepmath_rollout_only.sh

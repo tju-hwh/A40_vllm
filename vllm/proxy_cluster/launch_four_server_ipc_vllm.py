@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import signal
 import socket
 import subprocess
@@ -540,6 +541,10 @@ def main() -> int:
 
     try:
         os.remove(args.ipc_meta_path)
+    except FileNotFoundError:
+        pass
+    try:
+        shutil.rmtree("/tmp/vllm_kv_ipc")
     except FileNotFoundError:
         pass
 

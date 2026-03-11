@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import re
 import time
@@ -14,6 +15,8 @@ from urllib.parse import urlparse
 import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
+
+logger = logging.getLogger(__name__)
 
 
 def _strip_slash(url: str) -> str:
@@ -51,6 +54,7 @@ class ProxyConfig:
     kv_handoff_wait_timeout_s: float
     kv_handoff_stable_polls: int
     kv_handoff_soft_min_layers: int
+    kv_handoff_global_phase_barrier: bool
     max_response_length: int
     upstream_max_model_len: int
 
@@ -136,6 +140,8 @@ class ProxyConfig:
                 1, int(os.getenv("KV_HANDOFF_STABLE_POLLS", "2"))),
             kv_handoff_soft_min_layers=max(
                 1, int(os.getenv("KV_HANDOFF_SOFT_MIN_LAYERS", "8"))),
+            kv_handoff_global_phase_barrier=_parse_bool(
+                os.getenv("KV_HANDOFF_GLOBAL_PHASE_BARRIER"), default=False),
             max_response_length=max(1, int(os.getenv("MAX_RESPONSE_LENGTH", "4096"))),
             upstream_max_model_len=max(
                 1, int(os.getenv("UPSTREAM_MAX_MODEL_LEN", "3072"))),
@@ -146,9 +152,16 @@ class RouteState:
     def __init__(self, cfg: ProxyConfig):
         self.cfg = cfg
         self._lock = asyncio.Lock()
+        self._phase_cond = asyncio.Condition()
         self.decode_request_count = 0
         self.post_cutover_rr_index = 0
         self.decode_target_counts: dict[str, int] = {}
+        self._phase = "hop1"
+        self._phase_wave = 0
+        self._released_wave = -1
+        self._hop1_active = 0
+        self._hop2_active = 0
+        self._pending_hop2 = 0
 
     async def choose_target(self, path: str) -> tuple[str, Optional[int], str]:
         """Return target upstream, decode_idx (if counted), and route label."""
@@ -186,6 +199,76 @@ class RouteState:
     async def add_target_hit(self, target: str) -> None:
         async with self._lock:
             self.decode_target_counts[target] = self.decode_target_counts.get(target, 0) + 1
+
+    def _phase_barrier_enabled(self) -> bool:
+        return (self.cfg.routing_mode == "sequential_handoff"
+                and self.cfg.kv_handoff_global_phase_barrier
+                and len(self.cfg.sequential_targets) == 2)
+
+    async def phase_enter_hop1(self) -> int:
+        if not self._phase_barrier_enabled():
+            return 0
+        async with self._phase_cond:
+            while self._phase == "hop2":
+                await self._phase_cond.wait()
+            wave = self._phase_wave
+            self._hop1_active += 1
+            return wave
+
+    async def phase_finish_hop1(self, wave: int, needs_hop2: bool) -> bool:
+        if not self._phase_barrier_enabled():
+            return needs_hop2
+        async with self._phase_cond:
+            self._hop1_active = max(0, self._hop1_active - 1)
+            if needs_hop2:
+                self._pending_hop2 += 1
+            if self._hop1_active == 0:
+                if self._pending_hop2 > 0:
+                    self._phase = "hop2"
+                    self._released_wave = wave
+                else:
+                    self._phase = "hop1"
+                    self._phase_wave = max(self._phase_wave, wave + 1)
+                self._phase_cond.notify_all()
+            if not needs_hop2:
+                return False
+            while self._released_wave < wave:
+                await self._phase_cond.wait()
+            self._pending_hop2 = max(0, self._pending_hop2 - 1)
+            self._hop2_active += 1
+            return True
+
+    async def phase_finish_hop2(self, wave: int) -> None:
+        if not self._phase_barrier_enabled():
+            return
+        async with self._phase_cond:
+            self._hop2_active = max(0, self._hop2_active - 1)
+            if (self._phase == "hop2" and self._released_wave == wave
+                    and self._hop2_active == 0 and self._pending_hop2 == 0):
+                self._phase = "hop1"
+                self._phase_wave = max(self._phase_wave, wave + 1)
+                self._phase_cond.notify_all()
+
+    async def phase_abort_hop1(self, wave: int) -> None:
+        if not self._phase_barrier_enabled():
+            return
+        async with self._phase_cond:
+            self._hop1_active = max(0, self._hop1_active - 1)
+            if self._hop1_active == 0 and self._pending_hop2 == 0:
+                self._phase = "hop1"
+                self._phase_wave = max(self._phase_wave, wave + 1)
+                self._phase_cond.notify_all()
+
+    async def phase_abort_hop2(self, wave: int) -> None:
+        if not self._phase_barrier_enabled():
+            return
+        async with self._phase_cond:
+            self._hop2_active = max(0, self._hop2_active - 1)
+            if (self._phase == "hop2" and self._released_wave == wave
+                    and self._hop2_active == 0 and self._pending_hop2 == 0):
+                self._phase = "hop1"
+                self._phase_wave = max(self._phase_wave, wave + 1)
+                self._phase_cond.notify_all()
 
 
 def _is_stream_request(body: bytes, content_type: str | None) -> bool:
@@ -488,6 +571,83 @@ async def _handle_completion_sequential_handoff(
             await asyncio.sleep(0.1)
         return False
 
+    async def kv_owner_wait_publish_done(req_id: str, required_hop: int,
+                                         timeout_s: float) -> bool:
+        if not cfg.kv_owner_state_url:
+            return True
+        deadline = time.time() + max(0.1, timeout_s)
+        logger.info("kv wait publish_done req=%s hop>=%s timeout=%.1fs",
+                    req_id, required_hop, timeout_s)
+        last_obj: dict[str, Any] | None = None
+        while time.time() < deadline:
+            try:
+                resp = await client.get(
+                    cfg.kv_owner_state_url.rstrip("/") + f"/state/{req_id}")
+                if 200 <= resp.status_code < 300:
+                    obj = resp.json()
+                    if isinstance(obj, dict):
+                        last_obj = obj
+                    if (bool(obj.get("ok", False))
+                            and int(obj.get("publish_done_hop", 0)) >=
+                            int(required_hop)):
+                        logger.info("kv publish_done satisfied req=%s state=%s",
+                                    req_id, obj)
+                        return True
+            except Exception:
+                pass
+            await asyncio.sleep(0.05)
+        logger.error("kv publish_done timeout req=%s required_hop=%s state=%s",
+                     req_id, required_hop, last_obj)
+        return False
+
+    async def kv_owner_wait_load_ack(req_id: str, required_hop: int,
+                                     timeout_s: float) -> bool:
+        if not cfg.kv_owner_state_url:
+            return True
+        deadline = time.time() + max(0.1, timeout_s)
+        logger.info("kv wait load_ack req=%s hop>=%s timeout=%.1fs",
+                    req_id, required_hop, timeout_s)
+        last_obj: dict[str, Any] | None = None
+        while time.time() < deadline:
+            try:
+                resp = await client.get(
+                    cfg.kv_owner_state_url.rstrip("/") + f"/state/{req_id}")
+                if 200 <= resp.status_code < 300:
+                    obj = resp.json()
+                    if isinstance(obj, dict):
+                        last_obj = obj
+                    if (bool(obj.get("ok", False))
+                            and int(obj.get("load_ack_hop", 0)) >=
+                            int(required_hop)):
+                        logger.info("kv load_ack satisfied req=%s state=%s",
+                                    req_id, obj)
+                        return True
+            except Exception:
+                pass
+            await asyncio.sleep(0.05)
+        logger.error("kv load_ack timeout req=%s required_hop=%s state=%s",
+                     req_id, required_hop, last_obj)
+        return False
+
+    async def kv_owner_resume(req_id: str, worker: str, hop: int) -> bool:
+        if not cfg.kv_owner_state_url:
+            return True
+        try:
+            resp = await client.post(
+                cfg.kv_owner_state_url.rstrip("/") + "/resume",
+                json={"request_id": req_id, "worker": worker, "hop": hop},
+            )
+            ok = 200 <= resp.status_code < 300 and bool(resp.json().get("ok", False))
+            if ok:
+                logger.info("kv resume posted req=%s worker=%s hop=%s",
+                            req_id, worker, hop)
+            else:
+                logger.error("kv resume failed req=%s worker=%s hop=%s status=%s body=%s",
+                             req_id, worker, hop, resp.status_code, resp.text)
+            return ok
+        except Exception:
+            return False
+
     try:
         req_obj = json.loads(body.decode("utf-8"))
     except Exception as exc:
@@ -537,12 +697,18 @@ async def _handle_completion_sequential_handoff(
         kv_transfer_params = {"do_remote_prefill": False, "do_remote_decode": False}
 
     sum_completion_tokens = 0
+    all_completion_token_ids: list[int] = []
+    all_token_logprobs: list[Any] = []
+    first_prompt_token_ids: Optional[list[int]] = None
     first_prompt_tokens: Optional[int] = None
     last_resp: dict[str, Any] | None = None
     first_id = req_obj.get("request_id")
     base_request_id = str(first_id) if first_id else f"handoff-{uuid.uuid4().hex}"
     # Prevent state bleed when clients accidentally reuse request_id.
     await kv_owner_reset(base_request_id)
+    phase_wave = await state.phase_enter_hop1()
+    hop1_phase_done = False
+    hop2_phase_active = False
 
     for hop_idx, (target_base, hop_max_tokens) in enumerate(plan, start=1):
         is_last_hop = hop_idx == len(plan)
@@ -646,9 +812,25 @@ async def _handle_completion_sequential_handoff(
             next_target,
             next_kv_port,
         )
-        # Serial handoff barrier: before switching to next server, wait until
-        # producer KV metadata is visible in owner-state.
-        if hop_idx > 1 and cfg.kv_handoff_serial_barrier:
+        fast_phase_handoff = (
+            cfg.kv_handoff_global_phase_barrier
+            and len(cfg.sequential_targets) == 2
+            and hop_idx > 1
+        )
+        if hop_idx > 1 and not fast_phase_handoff:
+            if not await kv_owner_wait_publish_done(
+                    base_request_id, hop_idx - 1,
+                    cfg.kv_handoff_wait_timeout_s):
+                return JSONResponse(
+                    status_code=502,
+                    content={
+                        "error": "kv_publish_done_timeout",
+                        "upstream": target_base,
+                        "hop": hop_idx,
+                        "decode_idx": decode_idx,
+                    },
+                )
+        if hop_idx > 1 and cfg.kv_handoff_serial_barrier and not fast_phase_handoff:
             ready = await kv_owner_wait_ready(
                 base_request_id,
                 cfg.kv_handoff_min_layers,
@@ -700,14 +882,46 @@ async def _handle_completion_sequential_handoff(
         upstream_url = f"{target_base}{full_path}"
         if query:
             upstream_url = f"{upstream_url}?{query}"
-        try:
-            resp = await client.request(
+        req_task = asyncio.create_task(
+            client.request(
                 method="POST",
                 url=upstream_url,
                 headers=req_headers,
                 content=json.dumps(hop_req).encode("utf-8"),
-            )
+            ))
+        if hop_idx > 1 and not fast_phase_handoff:
+            acked = await kv_owner_wait_load_ack(base_request_id, hop_idx - 1,
+                                                 cfg.kv_handoff_wait_timeout_s)
+            if not acked:
+                req_task.cancel()
+                return JSONResponse(
+                    status_code=502,
+                    content={
+                        "error": "kv_load_ack_timeout",
+                        "upstream": target_base,
+                        "hop": hop_idx,
+                        "decode_idx": decode_idx,
+                    },
+                )
+            if not await kv_owner_resume(base_request_id, target_base,
+                                         hop_idx - 1):
+                req_task.cancel()
+                return JSONResponse(
+                    status_code=502,
+                    content={
+                        "error": "kv_resume_failed",
+                        "upstream": target_base,
+                        "hop": hop_idx,
+                        "decode_idx": decode_idx,
+                    },
+                )
+        try:
+            resp = await req_task
         except httpx.HTTPError as exc:
+            if hop_idx == 1 and not hop1_phase_done:
+                await state.phase_abort_hop1(phase_wave)
+            elif hop_idx > 1 and hop2_phase_active:
+                await state.phase_abort_hop2(phase_wave)
             return JSONResponse(
                 status_code=502,
                 content={
@@ -720,8 +934,27 @@ async def _handle_completion_sequential_handoff(
                     "hop": hop_idx,
                 },
             )
+        except asyncio.CancelledError:
+            if hop_idx == 1 and not hop1_phase_done:
+                await state.phase_abort_hop1(phase_wave)
+            elif hop_idx > 1 and hop2_phase_active:
+                await state.phase_abort_hop2(phase_wave)
+            return JSONResponse(
+                status_code=502,
+                content={
+                    "error": "cancelled_handoff_request",
+                    "upstream": target_base,
+                    "path": full_path,
+                    "decode_idx": decode_idx,
+                    "hop": hop_idx,
+                },
+            )
 
         if resp.status_code >= 400:
+            if hop_idx == 1 and not hop1_phase_done:
+                await state.phase_abort_hop1(phase_wave)
+            elif hop_idx > 1 and hop2_phase_active:
+                await state.phase_abort_hop2(phase_wave)
             try:
                 err_obj = resp.json()
             except Exception:
@@ -740,6 +973,10 @@ async def _handle_completion_sequential_handoff(
         try:
             resp_obj = resp.json()
         except Exception as exc:
+            if hop_idx == 1 and not hop1_phase_done:
+                await state.phase_abort_hop1(phase_wave)
+            elif hop_idx > 1 and hop2_phase_active:
+                await state.phase_abort_hop2(phase_wave)
             return JSONResponse(
                 status_code=502,
                 content={
@@ -771,11 +1008,19 @@ async def _handle_completion_sequential_handoff(
             ch0 = choices_obj[0] if isinstance(choices_obj[0], dict) else {}
             p_ids = ch0.get("prompt_token_ids")
             o_ids = ch0.get("token_ids")
+            logprobs_obj = ch0.get("logprobs") if isinstance(ch0, dict) else None
             if isinstance(o_ids, list) and all(isinstance(x, int) for x in o_ids):
+                all_completion_token_ids.extend(int(x) for x in o_ids)
                 if isinstance(p_ids, list) and all(isinstance(x, int) for x in p_ids):
+                    if first_prompt_token_ids is None:
+                        first_prompt_token_ids = list(p_ids)
                     cumulative_prompt_token_ids = list(p_ids) + list(o_ids)
                 elif cumulative_prompt_token_ids is not None:
                     cumulative_prompt_token_ids = cumulative_prompt_token_ids + list(o_ids)
+            if isinstance(logprobs_obj, dict):
+                token_logprobs = logprobs_obj.get("token_logprobs")
+                if isinstance(token_logprobs, list):
+                    all_token_logprobs.extend(token_logprobs)
         usage_obj = resp_obj.get("usage") or {}
         hop_completion_tokens = int(usage_obj.get("completion_tokens", 0)) \
             if isinstance(usage_obj.get("completion_tokens"), int) else 0
@@ -822,14 +1067,28 @@ async def _handle_completion_sequential_handoff(
         choices_obj = resp_obj.get("choices")
         if isinstance(choices_obj, list) and choices_obj and isinstance(choices_obj[0], dict):
             finish_reason = choices_obj[0].get("finish_reason")
+        should_continue = (finish_reason is None or str(finish_reason) == "length")
+        if hop_idx == 1 and not hop1_phase_done:
+            hop1_phase_done = True
+            hop2_phase_active = await state.phase_finish_hop1(
+                phase_wave, needs_hop2=(not is_last_hop and should_continue))
         if finish_reason is not None and str(finish_reason) != "length":
             break
 
     assert last_resp is not None
+    if hop2_phase_active:
+        await state.phase_finish_hop2(phase_wave)
     if len(plan) > 1:
         await kv_owner_release(base_request_id, plan[-1][0], len(plan))
     if "choices" in last_resp and isinstance(last_resp["choices"], list) and last_resp["choices"]:
         last_resp["choices"][0]["text"] = generated_text
+        if all_completion_token_ids:
+            last_resp["choices"][0]["token_ids"] = all_completion_token_ids
+        if first_prompt_token_ids is not None:
+            last_resp["choices"][0]["prompt_token_ids"] = first_prompt_token_ids
+        logprobs_obj = last_resp["choices"][0].get("logprobs")
+        if isinstance(logprobs_obj, dict) and all_token_logprobs:
+            logprobs_obj["token_logprobs"] = all_token_logprobs
     usage = last_resp.get("usage")
     if isinstance(usage, dict):
         if first_prompt_tokens is not None:
@@ -881,6 +1140,7 @@ def create_app() -> FastAPI:
             "kv_handoff_min_layers": cfg.kv_handoff_min_layers,
             "kv_handoff_wait_timeout_s": cfg.kv_handoff_wait_timeout_s,
             "kv_handoff_soft_min_layers": cfg.kv_handoff_soft_min_layers,
+            "kv_handoff_global_phase_barrier": cfg.kv_handoff_global_phase_barrier,
             "decode_request_count": state.decode_request_count,
             "decode_target_counts": state.decode_target_counts,
             "post_cutover_rr_index": state.post_cutover_rr_index,
