@@ -254,6 +254,11 @@ class _SharedBlockAllocator:
         # Post-cutover hops carry prefill_addr marker from previous server.
         return "___prefill_addr_" in str(request_id)
 
+    @staticmethod
+    def is_handoff_request_id(request_id: str) -> bool:
+        rid = str(request_id)
+        return ("___prefill_addr_" in rid) or ("___decode_addr_" in rid)
+
     def allocate_request_range(self, request_id: str, start: int,
                                end: int) -> list[int]:
         s = int(start)
@@ -727,7 +732,13 @@ class BlockPool:
             return False
         if not request_id:
             return False
-        return self._shared_allocator.is_post_cutover_request_id(request_id)
+        # Zero-copy shared-KV handoff requires producer and consumer to share
+        # the exact same global block ids. Restricting the shared allocator to
+        # post-cutover hops makes the producer allocate local-only ids while
+        # the consumer allocates shared ids, which corrupts handoff decode.
+        # Route every handoff-participating request through the shared block
+        # table so both servers resolve the same canonical request range.
+        return self._shared_allocator.is_handoff_request_id(request_id)
 
     def get_new_blocks_for_request(self, request_id: str, start: int,
                                    end: int) -> list[KVCacheBlock]:

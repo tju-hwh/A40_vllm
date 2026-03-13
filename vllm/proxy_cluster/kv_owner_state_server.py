@@ -23,6 +23,11 @@ class RequestState:
     publish_done_hop: int = 0
     load_ack_hop: int = 0
     resume_hop: int = 0
+    acquired_at: Optional[float] = None
+    commit_updated_at: Optional[float] = None
+    publish_done_at: dict[int, float] = field(default_factory=dict)
+    load_ack_at: dict[int, float] = field(default_factory=dict)
+    resume_at: dict[int, float] = field(default_factory=dict)
     # layer_name -> KV export metadata
     kv_by_layer: dict[str, dict[str, Any]] = field(default_factory=dict)
 
@@ -116,7 +121,9 @@ def create_app() -> FastAPI:
         st.owner = req.worker
         st.epoch += 1
         st.last_hop = req.hop
-        st.updated_at = time.time()
+        now = time.time()
+        st.acquired_at = now if st.acquired_at is None else st.acquired_at
+        st.updated_at = now
         return {
             "ok": True,
             "request_id": st.request_id,
@@ -136,7 +143,9 @@ def create_app() -> FastAPI:
             return {"ok": False, "error": "owner_mismatch", "owner": st.owner}
         st.committed_tokens += int(req.generated_tokens)
         st.last_hop = req.hop
-        st.updated_at = time.time()
+        now = time.time()
+        st.commit_updated_at = now
+        st.updated_at = now
         return {
             "ok": True,
             "request_id": st.request_id,
@@ -219,7 +228,9 @@ def create_app() -> FastAPI:
             st = RequestState(request_id=rid)
             states[rid] = st
         st.publish_done_hop = max(int(st.publish_done_hop), int(req.hop))
-        st.updated_at = time.time()
+        now = time.time()
+        st.publish_done_at[int(req.hop)] = now
+        st.updated_at = now
         logger.info("publish_done req=%s worker=%s hop=%s", rid, req.worker,
                     req.hop)
         return {"ok": True, "publish_done_hop": st.publish_done_hop}
@@ -233,7 +244,10 @@ def create_app() -> FastAPI:
             states[rid] = st
         st.load_ack_hop = max(int(st.load_ack_hop), int(req.hop))
         st.resume_hop = max(int(st.resume_hop), int(req.hop))
-        st.updated_at = time.time()
+        now = time.time()
+        st.load_ack_at[int(req.hop)] = now
+        st.resume_at[int(req.hop)] = now
+        st.updated_at = now
         logger.info("load_ack req=%s worker=%s hop=%s", rid, req.worker,
                     req.hop)
         return {
@@ -250,7 +264,9 @@ def create_app() -> FastAPI:
             st = RequestState(request_id=rid)
             states[rid] = st
         st.resume_hop = max(int(st.resume_hop), int(req.hop))
-        st.updated_at = time.time()
+        now = time.time()
+        st.resume_at[int(req.hop)] = now
+        st.updated_at = now
         logger.info("resume req=%s worker=%s hop=%s", rid, req.worker,
                     req.hop)
         return {"ok": True, "resume_hop": st.resume_hop}
@@ -286,6 +302,11 @@ def create_app() -> FastAPI:
             "load_ack_hop": st.load_ack_hop,
             "resume_hop": st.resume_hop,
             "num_kv_layers": len(st.kv_by_layer),
+            "acquired_at": st.acquired_at,
+            "commit_updated_at": st.commit_updated_at,
+            "publish_done_at": st.publish_done_at,
+            "load_ack_at": st.load_ack_at,
+            "resume_at": st.resume_at,
             "updated_at": st.updated_at,
         }
 
