@@ -4,7 +4,6 @@ import fcntl
 import hashlib
 import mmap
 import os
-import pickle
 import re
 import struct
 from collections.abc import Iterable
@@ -34,27 +33,29 @@ class _SharedBlockAllocator:
 
     def __init__(self, path: str, key: str, num_gpu_blocks: int, reset: bool):
         self._num_gpu_blocks = int(num_gpu_blocks)
+        self._refcnt_entry_size = 4
+        self._meta_entry_size = 8
+        self._meta_size = self._meta_entry_size * 3
         base = f"{path}.{key}"
-        self._state_path = f"{base}.pkl"
-        self._lock_path = f"{base}.lock"
-        self._refcnt_path = f"{base}.refcnt"
-        self._req_dir = f"{base}.reqs"
+        digest = hashlib.md5(base.encode(), usedforsecurity=False).hexdigest()
+        self._shm_dir = os.getenv("VLLM_SHARED_BLOCK_ALLOCATOR_SHM_DIR",
+                                  "/dev/shm").strip() or "/dev/shm"
+        self._base = os.path.join(self._shm_dir, f"vllm_sba_{digest}")
+        self._meta_path = f"{self._base}.meta"
+        self._lock_path = f"{self._base}.lock"
+        self._bitmap_path = f"{self._base}.bitmap"
+        self._refcnt_path = f"{self._base}.refcnt"
+        self._req_dir = f"{self._base}.reqs"
         self._refcnt_entry_size = 4
         if reset:
             self._initialize_state()
         else:
             # Best effort lazy init for first process that comes up.
-            if not os.path.exists(self._state_path):
+            if not os.path.exists(self._meta_path):
                 self._initialize_state()
 
     def _initialize_state(self) -> None:
-        state = {
-            "num_gpu_blocks": self._num_gpu_blocks,
-            # Keep block 0 reserved as null block.
-            "free_count": max(0, self._num_gpu_blocks - 1),
-            "next_scan_start": 1,
-        }
-        os.makedirs(os.path.dirname(self._state_path) or ".", exist_ok=True)
+        os.makedirs(self._shm_dir, exist_ok=True)
         if os.path.isdir(self._req_dir):
             for name in os.listdir(self._req_dir):
                 path = os.path.join(self._req_dir, name)
@@ -66,8 +67,32 @@ class _SharedBlockAllocator:
         os.makedirs(self._req_dir, exist_ok=True)
         with open(self._lock_path, "a+b"):
             pass
-        with open(self._state_path, "wb") as f:
-            pickle.dump(state, f, protocol=pickle.HIGHEST_PROTOCOL)
+        with open(self._meta_path, "wb") as f:
+            f.truncate(self._meta_size)
+        with open(self._meta_path, "r+b") as f:
+            mm = mmap.mmap(f.fileno(), 0)
+            try:
+                self._set_meta_num_gpu_blocks(mm, self._num_gpu_blocks)
+                self._set_meta_free_count(mm, max(0, self._num_gpu_blocks - 1))
+                self._set_meta_next_scan_start(mm, 1)
+                mm.flush()
+            finally:
+                mm.close()
+        bitmap_size = (self._num_gpu_blocks + 7) // 8
+        with open(self._bitmap_path, "wb") as f:
+            f.truncate(bitmap_size)
+        with open(self._bitmap_path, "r+b") as f:
+            mm = mmap.mmap(f.fileno(), 0)
+            try:
+                if bitmap_size > 0:
+                    mm[:] = b"\xff" * bitmap_size
+                self._set_free_bit(mm, 0, False)
+                # clear tail bits beyond num_gpu_blocks
+                for block_id in range(self._num_gpu_blocks, bitmap_size * 8):
+                    self._set_free_bit(mm, block_id, False)
+                mm.flush()
+            finally:
+                mm.close()
         with open(self._refcnt_path, "wb") as f:
             f.truncate(self._num_gpu_blocks * self._refcnt_entry_size)
         with open(self._refcnt_path, "r+b") as f:
@@ -79,46 +104,50 @@ class _SharedBlockAllocator:
                 mm.close()
 
     def _load_state(self) -> dict[str, Any]:
-        if not os.path.exists(self._state_path):
+        if not os.path.exists(self._meta_path):
             self._initialize_state()
-        with open(self._state_path, "rb") as f:
-            state = pickle.load(f)
-        if not isinstance(state, dict):
-            raise RuntimeError("shared allocator state is invalid")
-        if int(state.get("num_gpu_blocks", -1)) != self._num_gpu_blocks:
-            raise RuntimeError(
-                "shared allocator num_gpu_blocks mismatch: "
-                f"{state.get('num_gpu_blocks')} vs {self._num_gpu_blocks}")
-        # Backward-compat for older pickle-based state.
-        if "free_count" not in state:
-            free_intervals = state.get("free_intervals", [])
-            free_count = self._num_free_from_intervals(free_intervals)
-            state = {
-                "num_gpu_blocks": self._num_gpu_blocks,
-                "free_count": int(free_count),
-                "next_scan_start": 1,
-            }
-        return state
+        with open(self._meta_path, "r+b") as f:
+            mm = mmap.mmap(f.fileno(), 0)
+            try:
+                num_gpu_blocks = self._get_meta_num_gpu_blocks(mm)
+                if num_gpu_blocks != self._num_gpu_blocks:
+                    raise RuntimeError(
+                        "shared allocator num_gpu_blocks mismatch: "
+                        f"{num_gpu_blocks} vs {self._num_gpu_blocks}")
+                return {
+                    "num_gpu_blocks": num_gpu_blocks,
+                    "free_count": self._get_meta_free_count(mm),
+                    "next_scan_start": self._get_meta_next_scan_start(mm),
+                }
+            finally:
+                mm.close()
 
-    def _save_state(self, state: dict[str, Any]) -> None:
-        tmp = f"{self._state_path}.tmp.{os.getpid()}"
-        with open(tmp, "wb") as f:
-            pickle.dump(state, f, protocol=pickle.HIGHEST_PROTOCOL)
-        os.replace(tmp, self._state_path)
+    def _save_state(self, state: dict[str, Any], meta_mm: mmap.mmap) -> None:
+        self._set_meta_num_gpu_blocks(meta_mm, int(state["num_gpu_blocks"]))
+        self._set_meta_free_count(meta_mm, int(state["free_count"]))
+        self._set_meta_next_scan_start(meta_mm, int(state["next_scan_start"]))
 
     def _with_lock(self, fn):
         with open(self._lock_path, "a+b") as lf:
             fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
             try:
                 state = self._load_state()
-                with open(self._refcnt_path, "r+b") as rf:
-                    mm = mmap.mmap(rf.fileno(), 0)
+                with open(self._meta_path, "r+b") as mf, \
+                        open(self._bitmap_path, "r+b") as bf, \
+                        open(self._refcnt_path, "r+b") as rf:
+                    meta_mm = mmap.mmap(mf.fileno(), 0)
+                    bitmap_mm = mmap.mmap(bf.fileno(), 0)
+                    refcnt_mm = mmap.mmap(rf.fileno(), 0)
                     try:
-                        out = fn(state, mm)
-                        mm.flush()
+                        out = fn(state, meta_mm, bitmap_mm, refcnt_mm)
+                        self._save_state(state, meta_mm)
+                        meta_mm.flush()
+                        bitmap_mm.flush()
+                        refcnt_mm.flush()
                     finally:
-                        mm.close()
-                self._save_state(state)
+                        refcnt_mm.close()
+                        bitmap_mm.close()
+                        meta_mm.close()
                 return out
             finally:
                 fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
@@ -127,8 +156,17 @@ class _SharedBlockAllocator:
         with open(self._lock_path, "a+b") as lf:
             fcntl.flock(lf.fileno(), fcntl.LOCK_SH)
             try:
-                state = self._load_state()
-                return fn(state)
+                with open(self._meta_path, "r+b") as mf:
+                    meta_mm = mmap.mmap(mf.fileno(), 0)
+                    try:
+                        state = {
+                            "num_gpu_blocks": self._get_meta_num_gpu_blocks(meta_mm),
+                            "free_count": self._get_meta_free_count(meta_mm),
+                            "next_scan_start": self._get_meta_next_scan_start(meta_mm),
+                        }
+                        return fn(state)
+                    finally:
+                        meta_mm.close()
             finally:
                 fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
 
@@ -141,19 +179,43 @@ class _SharedBlockAllocator:
         path = self._req_file_path(req_key)
         if not os.path.exists(path):
             return []
-        with open(path, "rb") as f:
-            data = f.read()
-        if not data:
-            return []
-        count = len(data) // self._refcnt_entry_size
-        return list(struct.unpack(f"<{count}I", data))
+        with open(path, "r+b") as f:
+            mm = mmap.mmap(f.fileno(), 0)
+            try:
+                if mm.size() < 4:
+                    return []
+                count = int(struct.unpack_from("<I", mm, 0)[0])
+                if count <= 0:
+                    return []
+                return list(struct.unpack_from(f"<{count}I", mm, 4))
+            finally:
+                mm.close()
 
     def _append_req_blocks(self, req_key: str, block_ids: list[int]) -> None:
         if not block_ids:
             return
         path = self._req_file_path(req_key)
-        with open(path, "ab") as f:
-            f.write(struct.pack(f"<{len(block_ids)}I", *block_ids))
+        capacity = self._num_gpu_blocks
+        total_size = 4 + capacity * self._refcnt_entry_size
+        if not os.path.exists(path):
+            with open(path, "wb") as f:
+                f.truncate(total_size)
+        with open(path, "r+b") as f:
+            mm = mmap.mmap(f.fileno(), 0)
+            try:
+                count = int(struct.unpack_from("<I", mm, 0)[0])
+                new_count = count + len(block_ids)
+                if new_count > capacity:
+                    raise RuntimeError(
+                        f"shared allocator request block overflow: {new_count} > {capacity}"
+                    )
+                struct.pack_into(f"<{len(block_ids)}I", mm,
+                                 4 + count * self._refcnt_entry_size,
+                                 *block_ids)
+                struct.pack_into("<I", mm, 0, new_count)
+                mm.flush()
+            finally:
+                mm.close()
 
     def _delete_req_blocks(self, req_key: str) -> None:
         path = self._req_file_path(req_key)
@@ -170,9 +232,46 @@ class _SharedBlockAllocator:
         offset = int(block_id) * self._refcnt_entry_size
         struct.pack_into("<I", mm, offset, int(value))
 
+    def _get_meta_num_gpu_blocks(self, mm: mmap.mmap) -> int:
+        return int(struct.unpack_from("<Q", mm, 0)[0])
+
+    def _set_meta_num_gpu_blocks(self, mm: mmap.mmap, value: int) -> None:
+        struct.pack_into("<Q", mm, 0, int(value))
+
+    def _get_meta_free_count(self, mm: mmap.mmap) -> int:
+        return int(struct.unpack_from("<Q", mm, 8)[0])
+
+    def _set_meta_free_count(self, mm: mmap.mmap, value: int) -> None:
+        struct.pack_into("<Q", mm, 8, int(value))
+
+    def _get_meta_next_scan_start(self, mm: mmap.mmap) -> int:
+        return int(struct.unpack_from("<Q", mm, 16)[0])
+
+    def _set_meta_next_scan_start(self, mm: mmap.mmap, value: int) -> None:
+        struct.pack_into("<Q", mm, 16, int(value))
+
+    def _get_free_bit(self, mm: mmap.mmap, block_id: int) -> bool:
+        if block_id < 0:
+            return False
+        byte_idx = block_id >> 3
+        bit_mask = 1 << (block_id & 7)
+        return (mm[byte_idx] & bit_mask) != 0
+
+    def _set_free_bit(self, mm: mmap.mmap, block_id: int, is_free: bool) -> None:
+        if block_id < 0:
+            return
+        byte_idx = block_id >> 3
+        bit_mask = 1 << (block_id & 7)
+        cur = mm[byte_idx]
+        if is_free:
+            mm[byte_idx:byte_idx + 1] = bytes([cur | bit_mask])
+        else:
+            mm[byte_idx:byte_idx + 1] = bytes([cur & (~bit_mask & 0xFF)])
+
     def _alloc_free_blocks(self,
                            state: dict[str, Any],
-                           mm: mmap.mmap,
+                           bitmap_mm: mmap.mmap,
+                           refcnt_mm: mmap.mmap,
                            n: int) -> list[int]:
         want = int(n)
         if want <= 0:
@@ -190,8 +289,9 @@ class _SharedBlockAllocator:
                 wrapped = True
             if wrapped and block_id >= start:
                 break
-            if self._get_refcnt(mm, block_id) == 0:
-                self._set_refcnt(mm, block_id, 1)
+            if self._get_free_bit(bitmap_mm, block_id):
+                self._set_free_bit(bitmap_mm, block_id, False)
+                self._set_refcnt(refcnt_mm, block_id, 1)
                 out.append(int(block_id))
             block_id += 1
         if len(out) != want:
@@ -308,8 +408,9 @@ class _SharedBlockAllocator:
         if n <= 0:
             return []
 
-        def _op(state: dict[str, Any], mm: mmap.mmap) -> list[int]:
-            return self._alloc_free_blocks(state, mm, n)
+        def _op(state: dict[str, Any], meta_mm: mmap.mmap, bitmap_mm: mmap.mmap,
+                refcnt_mm: mmap.mmap) -> list[int]:
+            return self._alloc_free_blocks(state, bitmap_mm, refcnt_mm, n)
 
         return self._with_lock(_op)
 
@@ -351,15 +452,18 @@ class _SharedBlockAllocator:
             raise ValueError(f"invalid request range start={s}")
         req_key = self.canonical_request_id(request_id)
 
-        def _op(state: dict[str, Any], mm: mmap.mmap) -> list[int]:
+        def _op(state: dict[str, Any], meta_mm: mmap.mmap, bitmap_mm: mmap.mmap,
+                refcnt_mm: mmap.mmap) -> list[int]:
             req_blocks = self._read_req_blocks(req_key)
             old_len = len(req_blocks)
             if old_len < e:
-                picked = self._alloc_free_blocks(state, mm, e - old_len)
+                picked = self._alloc_free_blocks(state, bitmap_mm, refcnt_mm,
+                                                 e - old_len)
                 req_blocks.extend(int(x) for x in picked)
                 self._append_req_blocks(req_key, picked)
             for bid in req_blocks[s:min(e, old_len)]:
-                self._set_refcnt(mm, bid, self._get_refcnt(mm, bid) + 1)
+                self._set_refcnt(refcnt_mm, bid,
+                                 self._get_refcnt(refcnt_mm, bid) + 1)
             return [int(x) for x in req_blocks[s:e]]
 
         return self._with_lock(_op)
@@ -370,15 +474,17 @@ class _SharedBlockAllocator:
 
         want = [int(x) for x in block_ids]
 
-        def _op(state: dict[str, Any], mm: mmap.mmap) -> None:
+        def _op(state: dict[str, Any], meta_mm: mmap.mmap, bitmap_mm: mmap.mmap,
+                refcnt_mm: mmap.mmap) -> None:
             for bid in want:
-                cur = self._get_refcnt(mm, bid)
-                if cur == 0:
-                    self._set_refcnt(mm, bid, 1)
+                cur = self._get_refcnt(refcnt_mm, bid)
+                if cur == 0 and self._get_free_bit(bitmap_mm, bid):
+                    self._set_free_bit(bitmap_mm, bid, False)
+                    self._set_refcnt(refcnt_mm, bid, 1)
                     state["free_count"] = max(
                         0, int(state.get("free_count", 0)) - 1)
                 else:
-                    self._set_refcnt(mm, bid, cur + 1)
+                    self._set_refcnt(refcnt_mm, bid, cur + 1)
             return None
 
         self._with_lock(_op)
@@ -389,15 +495,17 @@ class _SharedBlockAllocator:
 
         free_ids = [int(x) for x in block_ids if int(x) > 0]
 
-        def _op(state: dict[str, Any], mm: mmap.mmap) -> None:
+        def _op(state: dict[str, Any], meta_mm: mmap.mmap, bitmap_mm: mmap.mmap,
+                refcnt_mm: mmap.mmap) -> None:
             for bid in free_ids:
-                cur = self._get_refcnt(mm, bid)
+                cur = self._get_refcnt(refcnt_mm, bid)
                 if cur <= 1:
                     if cur == 1:
-                        self._set_refcnt(mm, bid, 0)
+                        self._set_refcnt(refcnt_mm, bid, 0)
+                        self._set_free_bit(bitmap_mm, bid, True)
                         state["free_count"] = int(state.get("free_count", 0)) + 1
                 else:
-                    self._set_refcnt(mm, bid, cur - 1)
+                    self._set_refcnt(refcnt_mm, bid, cur - 1)
             return None
 
         self._with_lock(_op)
@@ -411,15 +519,17 @@ class _SharedBlockAllocator:
         req_key = self.canonical_request_id(request_id)
         free_ids = [int(x) for x in block_ids if int(x) > 0]
 
-        def _op(state: dict[str, Any], mm: mmap.mmap) -> None:
+        def _op(state: dict[str, Any], meta_mm: mmap.mmap, bitmap_mm: mmap.mmap,
+                refcnt_mm: mmap.mmap) -> None:
             for bid in free_ids:
-                cur = self._get_refcnt(mm, bid)
+                cur = self._get_refcnt(refcnt_mm, bid)
                 if cur <= 1:
                     if cur == 1:
-                        self._set_refcnt(mm, bid, 0)
+                        self._set_refcnt(refcnt_mm, bid, 0)
+                        self._set_free_bit(bitmap_mm, bid, True)
                         state["free_count"] = int(state.get("free_count", 0)) + 1
                 else:
-                    self._set_refcnt(mm, bid, cur - 1)
+                    self._set_refcnt(refcnt_mm, bid, cur - 1)
             if terminal:
                 self._delete_req_blocks(req_key)
             return None
