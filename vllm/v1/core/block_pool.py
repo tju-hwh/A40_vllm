@@ -1,9 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import fcntl
+import hashlib
+import mmap
 import os
 import pickle
 import re
+import struct
 from collections.abc import Iterable
 from typing import Any, Optional, Union
 
@@ -34,6 +37,9 @@ class _SharedBlockAllocator:
         base = f"{path}.{key}"
         self._state_path = f"{base}.pkl"
         self._lock_path = f"{base}.lock"
+        self._refcnt_path = f"{base}.refcnt"
+        self._req_dir = f"{base}.reqs"
+        self._refcnt_entry_size = 4
         if reset:
             self._initialize_state()
         else:
@@ -45,18 +51,32 @@ class _SharedBlockAllocator:
         state = {
             "num_gpu_blocks": self._num_gpu_blocks,
             # Keep block 0 reserved as null block.
-            # free_intervals is a list of inclusive ranges: [[start, end], ...]
-            "free_intervals": [[1, self._num_gpu_blocks - 1]]
-            if self._num_gpu_blocks > 1 else [],
-            "refcnt": {},
-            # canonical_request_id -> ordered block ids (global block table)
-            "req_blocks": {},
+            "free_count": max(0, self._num_gpu_blocks - 1),
+            "next_scan_start": 1,
         }
         os.makedirs(os.path.dirname(self._state_path) or ".", exist_ok=True)
+        if os.path.isdir(self._req_dir):
+            for name in os.listdir(self._req_dir):
+                path = os.path.join(self._req_dir, name)
+                if os.path.isfile(path):
+                    try:
+                        os.remove(path)
+                    except OSError:
+                        pass
+        os.makedirs(self._req_dir, exist_ok=True)
         with open(self._lock_path, "a+b"):
             pass
         with open(self._state_path, "wb") as f:
             pickle.dump(state, f, protocol=pickle.HIGHEST_PROTOCOL)
+        with open(self._refcnt_path, "wb") as f:
+            f.truncate(self._num_gpu_blocks * self._refcnt_entry_size)
+        with open(self._refcnt_path, "r+b") as f:
+            mm = mmap.mmap(f.fileno(), 0)
+            try:
+                self._set_refcnt(mm, 0, 1)
+                mm.flush()
+            finally:
+                mm.close()
 
     def _load_state(self) -> dict[str, Any]:
         if not os.path.exists(self._state_path):
@@ -69,29 +89,15 @@ class _SharedBlockAllocator:
             raise RuntimeError(
                 "shared allocator num_gpu_blocks mismatch: "
                 f"{state.get('num_gpu_blocks')} vs {self._num_gpu_blocks}")
-        # Backward-compat: convert legacy free_blocks list to intervals.
-        if "free_intervals" not in state:
-            free_blocks = state.get("free_blocks", [])
-            if not isinstance(free_blocks, list):
-                free_blocks = []
-            free_blocks = sorted(int(x) for x in free_blocks if int(x) > 0)
-            free_intervals: list[list[int]] = []
-            if free_blocks:
-                s = free_blocks[0]
-                e = s
-                for b in free_blocks[1:]:
-                    if b == e + 1:
-                        e = b
-                    else:
-                        free_intervals.append([s, e])
-                        s = b
-                        e = b
-                free_intervals.append([s, e])
-            state["free_intervals"] = free_intervals
-            state.pop("free_blocks", None)
-        state.setdefault("free_intervals", [])
-        state.setdefault("refcnt", {})
-        state.setdefault("req_blocks", {})
+        # Backward-compat for older pickle-based state.
+        if "free_count" not in state:
+            free_intervals = state.get("free_intervals", [])
+            free_count = self._num_free_from_intervals(free_intervals)
+            state = {
+                "num_gpu_blocks": self._num_gpu_blocks,
+                "free_count": int(free_count),
+                "next_scan_start": 1,
+            }
         return state
 
     def _save_state(self, state: dict[str, Any]) -> None:
@@ -105,11 +111,95 @@ class _SharedBlockAllocator:
             fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
             try:
                 state = self._load_state()
-                out = fn(state)
+                with open(self._refcnt_path, "r+b") as rf:
+                    mm = mmap.mmap(rf.fileno(), 0)
+                    try:
+                        out = fn(state, mm)
+                        mm.flush()
+                    finally:
+                        mm.close()
                 self._save_state(state)
                 return out
             finally:
                 fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
+
+    def _with_shared_lock(self, fn):
+        with open(self._lock_path, "a+b") as lf:
+            fcntl.flock(lf.fileno(), fcntl.LOCK_SH)
+            try:
+                state = self._load_state()
+                return fn(state)
+            finally:
+                fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
+
+    def _req_file_path(self, req_key: str) -> str:
+        digest = hashlib.md5(req_key.encode(),
+                             usedforsecurity=False).hexdigest()
+        return os.path.join(self._req_dir, f"{digest}.bin")
+
+    def _read_req_blocks(self, req_key: str) -> list[int]:
+        path = self._req_file_path(req_key)
+        if not os.path.exists(path):
+            return []
+        with open(path, "rb") as f:
+            data = f.read()
+        if not data:
+            return []
+        count = len(data) // self._refcnt_entry_size
+        return list(struct.unpack(f"<{count}I", data))
+
+    def _append_req_blocks(self, req_key: str, block_ids: list[int]) -> None:
+        if not block_ids:
+            return
+        path = self._req_file_path(req_key)
+        with open(path, "ab") as f:
+            f.write(struct.pack(f"<{len(block_ids)}I", *block_ids))
+
+    def _delete_req_blocks(self, req_key: str) -> None:
+        path = self._req_file_path(req_key)
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            return
+
+    def _get_refcnt(self, mm: mmap.mmap, block_id: int) -> int:
+        offset = int(block_id) * self._refcnt_entry_size
+        return int(struct.unpack_from("<I", mm, offset)[0])
+
+    def _set_refcnt(self, mm: mmap.mmap, block_id: int, value: int) -> None:
+        offset = int(block_id) * self._refcnt_entry_size
+        struct.pack_into("<I", mm, offset, int(value))
+
+    def _alloc_free_blocks(self,
+                           state: dict[str, Any],
+                           mm: mmap.mmap,
+                           n: int) -> list[int]:
+        want = int(n)
+        if want <= 0:
+            return []
+        if int(state.get("free_count", 0)) < want:
+            raise ValueError(
+                f"Cannot get {want} free blocks from shared allocator")
+        out: list[int] = []
+        start = max(1, int(state.get("next_scan_start", 1)))
+        block_id = start
+        wrapped = False
+        while len(out) < want:
+            if block_id >= self._num_gpu_blocks:
+                block_id = 1
+                wrapped = True
+            if wrapped and block_id >= start:
+                break
+            if self._get_refcnt(mm, block_id) == 0:
+                self._set_refcnt(mm, block_id, 1)
+                out.append(int(block_id))
+            block_id += 1
+        if len(out) != want:
+            raise ValueError(
+                f"Cannot get {want} free blocks from shared allocator")
+        state["free_count"] = int(state.get("free_count", 0)) - len(out)
+        state["next_scan_start"] = int(block_id)
+        return out
 
     @staticmethod
     def _num_free_from_intervals(intervals: list[list[int]]) -> int:
@@ -218,16 +308,8 @@ class _SharedBlockAllocator:
         if n <= 0:
             return []
 
-        def _op(state: dict[str, Any]) -> list[int]:
-            free_intervals: list[list[int]] = state["free_intervals"]
-            if self._num_free_from_intervals(free_intervals) < n:
-                raise ValueError(
-                    f"Cannot get {n} free blocks from shared allocator")
-            picked = self._take_from_intervals(free_intervals, n)
-            refcnt: dict[int, int] = state["refcnt"]
-            for bid in picked:
-                refcnt[int(bid)] = int(refcnt.get(int(bid), 0)) + 1
-            return [int(x) for x in picked]
+        def _op(state: dict[str, Any], mm: mmap.mmap) -> list[int]:
+            return self._alloc_free_blocks(state, mm, n)
 
         return self._with_lock(_op)
 
@@ -269,26 +351,16 @@ class _SharedBlockAllocator:
             raise ValueError(f"invalid request range start={s}")
         req_key = self.canonical_request_id(request_id)
 
-        def _op(state: dict[str, Any]) -> list[int]:
-            req_blocks_map: dict[str, list[int]] = state["req_blocks"]
-            req_blocks = req_blocks_map.get(req_key)
-            if req_blocks is None:
-                req_blocks = []
-                req_blocks_map[req_key] = req_blocks
-            if len(req_blocks) < e:
-                need = e - len(req_blocks)
-                free_intervals: list[list[int]] = state["free_intervals"]
-                if self._num_free_from_intervals(free_intervals) < need:
-                    raise ValueError(
-                        f"Cannot get {need} free blocks from shared allocator"
-                    )
-                picked = self._take_from_intervals(free_intervals, need)
+        def _op(state: dict[str, Any], mm: mmap.mmap) -> list[int]:
+            req_blocks = self._read_req_blocks(req_key)
+            old_len = len(req_blocks)
+            if old_len < e:
+                picked = self._alloc_free_blocks(state, mm, e - old_len)
                 req_blocks.extend(int(x) for x in picked)
-            out = [int(x) for x in req_blocks[s:e]]
-            refcnt: dict[int, int] = state["refcnt"]
-            for bid in out:
-                refcnt[bid] = int(refcnt.get(bid, 0)) + 1
-            return out
+                self._append_req_blocks(req_key, picked)
+            for bid in req_blocks[s:min(e, old_len)]:
+                self._set_refcnt(mm, bid, self._get_refcnt(mm, bid) + 1)
+            return [int(x) for x in req_blocks[s:e]]
 
         return self._with_lock(_op)
 
@@ -298,16 +370,15 @@ class _SharedBlockAllocator:
 
         want = [int(x) for x in block_ids]
 
-        def _op(state: dict[str, Any]) -> None:
-            free_intervals: list[list[int]] = state["free_intervals"]
-            refcnt: dict[int, int] = state["refcnt"]
-            removed = set(self._remove_specific_from_intervals(
-                free_intervals, want))
+        def _op(state: dict[str, Any], mm: mmap.mmap) -> None:
             for bid in want:
-                if bid in removed:
-                    refcnt[bid] = 1
+                cur = self._get_refcnt(mm, bid)
+                if cur == 0:
+                    self._set_refcnt(mm, bid, 1)
+                    state["free_count"] = max(
+                        0, int(state.get("free_count", 0)) - 1)
                 else:
-                    refcnt[bid] = int(refcnt.get(bid, 0)) + 1
+                    self._set_refcnt(mm, bid, cur + 1)
             return None
 
         self._with_lock(_op)
@@ -318,18 +389,15 @@ class _SharedBlockAllocator:
 
         free_ids = [int(x) for x in block_ids if int(x) > 0]
 
-        def _op(state: dict[str, Any]) -> None:
-            refcnt: dict[int, int] = state["refcnt"]
-            to_free: list[int] = []
+        def _op(state: dict[str, Any], mm: mmap.mmap) -> None:
             for bid in free_ids:
-                cur = int(refcnt.get(bid, 0))
+                cur = self._get_refcnt(mm, bid)
                 if cur <= 1:
-                    refcnt.pop(bid, None)
-                    to_free.append(bid)
+                    if cur == 1:
+                        self._set_refcnt(mm, bid, 0)
+                        state["free_count"] = int(state.get("free_count", 0)) + 1
                 else:
-                    refcnt[bid] = cur - 1
-            if to_free:
-                self._add_ids_to_intervals(state["free_intervals"], to_free)
+                    self._set_refcnt(mm, bid, cur - 1)
             return None
 
         self._with_lock(_op)
@@ -343,40 +411,26 @@ class _SharedBlockAllocator:
         req_key = self.canonical_request_id(request_id)
         free_ids = [int(x) for x in block_ids if int(x) > 0]
 
-        def _op(state: dict[str, Any]) -> None:
-            refcnt: dict[int, int] = state["refcnt"]
-            free_intervals: list[list[int]] = state["free_intervals"]
-            req_blocks_map: dict[str, list[int]] = state["req_blocks"]
-            to_free: list[int] = []
+        def _op(state: dict[str, Any], mm: mmap.mmap) -> None:
             for bid in free_ids:
-                cur = int(refcnt.get(bid, 0))
+                cur = self._get_refcnt(mm, bid)
                 if cur <= 1:
-                    refcnt.pop(bid, None)
-                    to_free.append(bid)
+                    if cur == 1:
+                        self._set_refcnt(mm, bid, 0)
+                        state["free_count"] = int(state.get("free_count", 0)) + 1
                 else:
-                    refcnt[bid] = cur - 1
-            if to_free:
-                self._add_ids_to_intervals(free_intervals, to_free)
-
+                    self._set_refcnt(mm, bid, cur - 1)
             if terminal:
-                reserved = req_blocks_map.pop(req_key, [])
-                if reserved:
-                    reclaimed: list[int] = []
-                    for bid in reserved:
-                        b = int(bid)
-                        if int(refcnt.get(b, 0)) == 0:
-                            reclaimed.append(b)
-                    if reclaimed:
-                        self._add_ids_to_intervals(free_intervals, reclaimed)
+                self._delete_req_blocks(req_key)
             return None
 
         self._with_lock(_op)
 
     def num_free_blocks(self) -> int:
         def _op(state: dict[str, Any]) -> int:
-            return self._num_free_from_intervals(state["free_intervals"])
+            return int(state.get("free_count", 0))
 
-        return int(self._with_lock(_op))
+        return int(self._with_shared_lock(_op))
 
 
 class BlockHashToBlockMap:
