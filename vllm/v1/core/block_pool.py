@@ -6,6 +6,7 @@ import mmap
 import os
 import re
 import struct
+from array import array
 from collections.abc import Iterable
 from typing import Any, Optional, Union
 
@@ -24,6 +25,61 @@ from vllm.v1.request import Request
 logger = init_logger(__name__)
 
 
+def _get_env_first(*names: str) -> str:
+    for name in names:
+        value = os.getenv(name, "").strip()
+        if value:
+            return value
+    return ""
+
+
+def _resolve_shared_allocator_key() -> str:
+    """Build a stable shard key for the shared block allocator.
+
+    We want producer/consumer workers that represent the same TP shard to
+    share one allocator namespace, while different TP shards should not
+    contend on the same allocator files.
+    """
+    cvd = os.getenv("CUDA_VISIBLE_DEVICES", "all").strip() or "all"
+    local_rank = _get_env_first("LOCAL_RANK", "LOCAL_WORLD_RANK", "OMPI_COMM_WORLD_LOCAL_RANK")
+    global_rank = _get_env_first("RANK", "WORLD_RANK", "OMPI_COMM_WORLD_RANK")
+    tp_rank = _get_env_first("VLLM_TP_RANK", "TENSOR_PARALLEL_RANK")
+
+    phys = ""
+    try:
+        import torch  # local import to avoid hard dependency here
+        if torch.cuda.is_available():
+            local_idx = int(torch.cuda.current_device())
+            phys = str(local_idx)
+            if cvd != "all":
+                parts = [x.strip() for x in cvd.split(",") if x.strip()]
+                if 0 <= local_idx < len(parts):
+                    phys = parts[local_idx]
+    except Exception:
+        pass
+
+    if not phys:
+        if cvd != "all":
+            parts = [x.strip() for x in cvd.split(",") if x.strip()]
+            rank_idx = None
+            for raw in (local_rank, tp_rank):
+                if raw:
+                    try:
+                        rank_idx = int(raw)
+                        break
+                    except ValueError:
+                        pass
+            if rank_idx is not None and 0 <= rank_idx < len(parts):
+                phys = parts[rank_idx]
+            elif parts:
+                phys = parts[0]
+        else:
+            phys = "all"
+
+    shard_rank = tp_rank or local_rank or global_rank or "0"
+    return f"gpu{phys}__shard{shard_rank}"
+
+
 class _SharedBlockAllocator:
     """Process-shared block allocator (experimental).
 
@@ -36,6 +92,12 @@ class _SharedBlockAllocator:
         self._refcnt_entry_size = 4
         self._meta_entry_size = 8
         self._meta_size = self._meta_entry_size * 3
+        self._req_growth_chunk = max(
+            1, int(os.getenv("VLLM_SHARED_BLOCK_ALLOCATOR_REQ_GROWTH", "8")))
+        self._flush_writes = os.getenv(
+            "VLLM_SHARED_BLOCK_ALLOCATOR_FLUSH_WRITES", "").strip().lower() in {
+                "1", "true", "yes", "on"
+            }
         base = f"{path}.{key}"
         digest = hashlib.md5(base.encode(), usedforsecurity=False).hexdigest()
         self._shm_dir = os.getenv("VLLM_SHARED_BLOCK_ALLOCATOR_SHM_DIR",
@@ -47,12 +109,23 @@ class _SharedBlockAllocator:
         self._refcnt_path = f"{self._base}.refcnt"
         self._req_dir = f"{self._base}.reqs"
         self._refcnt_entry_size = 4
+        self._lock_file = None
+        self._meta_file = None
+        self._bitmap_file = None
+        self._refcnt_file = None
+        self._meta_mm: Optional[mmap.mmap] = None
+        self._bitmap_mm: Optional[mmap.mmap] = None
+        self._refcnt_mm: Optional[mmap.mmap] = None
+        self._req_cache: dict[str, list[int]] = {}
+        self._req_files: dict[str, Any] = {}
+        self._req_mmaps: dict[str, mmap.mmap] = {}
         if reset:
             self._initialize_state()
         else:
             # Best effort lazy init for first process that comes up.
             if not os.path.exists(self._meta_path):
                 self._initialize_state()
+        self._open_shared_state()
 
     def _initialize_state(self) -> None:
         os.makedirs(self._shm_dir, exist_ok=True)
@@ -104,23 +177,37 @@ class _SharedBlockAllocator:
                 mm.close()
 
     def _load_state(self) -> dict[str, Any]:
+        if self._meta_mm is None:
+            self._open_shared_state()
+        assert self._meta_mm is not None
+        num_gpu_blocks = self._get_meta_num_gpu_blocks(self._meta_mm)
+        if num_gpu_blocks != self._num_gpu_blocks:
+            raise RuntimeError(
+                "shared allocator num_gpu_blocks mismatch: "
+                f"{num_gpu_blocks} vs {self._num_gpu_blocks}")
+        return {
+            "num_gpu_blocks": num_gpu_blocks,
+            "free_count": self._get_meta_free_count(self._meta_mm),
+            "next_scan_start": self._get_meta_next_scan_start(self._meta_mm),
+        }
+
+    def _open_shared_state(self) -> None:
         if not os.path.exists(self._meta_path):
             self._initialize_state()
-        with open(self._meta_path, "r+b") as f:
-            mm = mmap.mmap(f.fileno(), 0)
-            try:
-                num_gpu_blocks = self._get_meta_num_gpu_blocks(mm)
-                if num_gpu_blocks != self._num_gpu_blocks:
-                    raise RuntimeError(
-                        "shared allocator num_gpu_blocks mismatch: "
-                        f"{num_gpu_blocks} vs {self._num_gpu_blocks}")
-                return {
-                    "num_gpu_blocks": num_gpu_blocks,
-                    "free_count": self._get_meta_free_count(mm),
-                    "next_scan_start": self._get_meta_next_scan_start(mm),
-                }
-            finally:
-                mm.close()
+        if self._lock_file is None:
+            self._lock_file = open(self._lock_path, "a+b")
+        if self._meta_file is None:
+            self._meta_file = open(self._meta_path, "r+b")
+        if self._bitmap_file is None:
+            self._bitmap_file = open(self._bitmap_path, "r+b")
+        if self._refcnt_file is None:
+            self._refcnt_file = open(self._refcnt_path, "r+b")
+        if self._meta_mm is None:
+            self._meta_mm = mmap.mmap(self._meta_file.fileno(), 0)
+        if self._bitmap_mm is None:
+            self._bitmap_mm = mmap.mmap(self._bitmap_file.fileno(), 0)
+        if self._refcnt_mm is None:
+            self._refcnt_mm = mmap.mmap(self._refcnt_file.fileno(), 0)
 
     def _save_state(self, state: dict[str, Any], meta_mm: mmap.mmap) -> None:
         self._set_meta_num_gpu_blocks(meta_mm, int(state["num_gpu_blocks"]))
@@ -128,101 +215,121 @@ class _SharedBlockAllocator:
         self._set_meta_next_scan_start(meta_mm, int(state["next_scan_start"]))
 
     def _with_lock(self, fn):
-        with open(self._lock_path, "a+b") as lf:
-            fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
-            try:
-                state = self._load_state()
-                with open(self._meta_path, "r+b") as mf, \
-                        open(self._bitmap_path, "r+b") as bf, \
-                        open(self._refcnt_path, "r+b") as rf:
-                    meta_mm = mmap.mmap(mf.fileno(), 0)
-                    bitmap_mm = mmap.mmap(bf.fileno(), 0)
-                    refcnt_mm = mmap.mmap(rf.fileno(), 0)
-                    try:
-                        out = fn(state, meta_mm, bitmap_mm, refcnt_mm)
-                        self._save_state(state, meta_mm)
-                        meta_mm.flush()
-                        bitmap_mm.flush()
-                        refcnt_mm.flush()
-                    finally:
-                        refcnt_mm.close()
-                        bitmap_mm.close()
-                        meta_mm.close()
-                return out
-            finally:
-                fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
+        self._open_shared_state()
+        assert self._lock_file is not None
+        assert self._meta_mm is not None
+        assert self._bitmap_mm is not None
+        assert self._refcnt_mm is not None
+        fcntl.flock(self._lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            state = self._load_state()
+            out = fn(state, self._meta_mm, self._bitmap_mm, self._refcnt_mm)
+            self._save_state(state, self._meta_mm)
+            if self._flush_writes:
+                self._meta_mm.flush()
+                self._bitmap_mm.flush()
+                self._refcnt_mm.flush()
+            return out
+        finally:
+            fcntl.flock(self._lock_file.fileno(), fcntl.LOCK_UN)
 
     def _with_shared_lock(self, fn):
-        with open(self._lock_path, "a+b") as lf:
-            fcntl.flock(lf.fileno(), fcntl.LOCK_SH)
-            try:
-                with open(self._meta_path, "r+b") as mf:
-                    meta_mm = mmap.mmap(mf.fileno(), 0)
-                    try:
-                        state = {
-                            "num_gpu_blocks": self._get_meta_num_gpu_blocks(meta_mm),
-                            "free_count": self._get_meta_free_count(meta_mm),
-                            "next_scan_start": self._get_meta_next_scan_start(meta_mm),
-                        }
-                        return fn(state)
-                    finally:
-                        meta_mm.close()
-            finally:
-                fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
+        self._open_shared_state()
+        assert self._lock_file is not None
+        assert self._meta_mm is not None
+        fcntl.flock(self._lock_file.fileno(), fcntl.LOCK_SH)
+        try:
+            state = {
+                "num_gpu_blocks": self._get_meta_num_gpu_blocks(self._meta_mm),
+                "free_count": self._get_meta_free_count(self._meta_mm),
+                "next_scan_start": self._get_meta_next_scan_start(self._meta_mm),
+            }
+            return fn(state)
+        finally:
+            fcntl.flock(self._lock_file.fileno(), fcntl.LOCK_UN)
 
     def _req_file_path(self, req_key: str) -> str:
         digest = hashlib.md5(req_key.encode(),
                              usedforsecurity=False).hexdigest()
         return os.path.join(self._req_dir, f"{digest}.bin")
 
-    def _read_req_blocks(self, req_key: str) -> list[int]:
-        path = self._req_file_path(req_key)
-        if not os.path.exists(path):
-            return []
-        with open(path, "r+b") as f:
-            mm = mmap.mmap(f.fileno(), 0)
-            try:
-                if mm.size() < 4:
-                    return []
-                count = int(struct.unpack_from("<I", mm, 0)[0])
-                if count <= 0:
-                    return []
-                return list(struct.unpack_from(f"<{count}I", mm, 4))
-            finally:
-                mm.close()
-
-    def _append_req_blocks(self, req_key: str, block_ids: list[int]) -> None:
-        if not block_ids:
-            return
+    def _open_req_mmap(self, req_key: str, create: bool = False) -> Optional[mmap.mmap]:
         path = self._req_file_path(req_key)
         capacity = self._num_gpu_blocks
         total_size = 4 + capacity * self._refcnt_entry_size
         if not os.path.exists(path):
+            if not create:
+                return None
             with open(path, "wb") as f:
                 f.truncate(total_size)
-        with open(path, "r+b") as f:
-            mm = mmap.mmap(f.fileno(), 0)
+        mm = self._req_mmaps.get(req_key)
+        if mm is not None:
+            return mm
+        f = open(path, "r+b")
+        mm = mmap.mmap(f.fileno(), 0)
+        self._req_files[req_key] = f
+        self._req_mmaps[req_key] = mm
+        return mm
+
+    def _close_req_mmap(self, req_key: str) -> None:
+        mm = self._req_mmaps.pop(req_key, None)
+        if mm is not None:
             try:
-                count = int(struct.unpack_from("<I", mm, 0)[0])
-                new_count = count + len(block_ids)
-                if new_count > capacity:
-                    raise RuntimeError(
-                        f"shared allocator request block overflow: {new_count} > {capacity}"
-                    )
-                struct.pack_into(f"<{len(block_ids)}I", mm,
-                                 4 + count * self._refcnt_entry_size,
-                                 *block_ids)
-                struct.pack_into("<I", mm, 0, new_count)
-                mm.flush()
-            finally:
                 mm.close()
+            except Exception:
+                pass
+        f = self._req_files.pop(req_key, None)
+        if f is not None:
+            try:
+                f.close()
+            except Exception:
+                pass
+
+    def _read_req_blocks(self, req_key: str) -> list[int]:
+        cached = self._req_cache.get(req_key)
+        if cached is not None:
+            return list(cached)
+        mm = self._open_req_mmap(req_key, create=False)
+        if mm is None:
+            return []
+        if mm.size() < 4:
+            return []
+        count = int(struct.unpack_from("<I", mm, 0)[0])
+        if count <= 0:
+            return []
+        out = list(struct.unpack_from(f"<{count}I", mm, 4))
+        self._req_cache[req_key] = list(out)
+        return out
+
+    def _append_req_blocks(self, req_key: str, block_ids: list[int]) -> None:
+        if not block_ids:
+            return
+        mm = self._open_req_mmap(req_key, create=True)
+        assert mm is not None
+        count = int(struct.unpack_from("<I", mm, 0)[0])
+        new_count = count + len(block_ids)
+        if new_count > self._num_gpu_blocks:
+            raise RuntimeError(
+                f"shared allocator request block overflow: {new_count} > {self._num_gpu_blocks}"
+            )
+        struct.pack_into(f"<{len(block_ids)}I", mm,
+                         4 + count * self._refcnt_entry_size, *block_ids)
+        struct.pack_into("<I", mm, 0, new_count)
+        if self._flush_writes:
+            mm.flush()
+        existing = self._req_cache.get(req_key)
+        if existing is None:
+            existing = [int(x) for x in struct.unpack_from(f"<{count}I", mm, 4)] if count > 0 else []
+        self._req_cache[req_key] = list(existing) + [int(x) for x in block_ids]
 
     def _delete_req_blocks(self, req_key: str) -> None:
         path = self._req_file_path(req_key)
+        self._close_req_mmap(req_key)
         try:
             os.remove(path)
         except FileNotFoundError:
             return
+        self._req_cache.pop(req_key, None)
 
     def _get_refcnt(self, mm: mmap.mmap, block_id: int) -> int:
         offset = int(block_id) * self._refcnt_entry_size
@@ -300,6 +407,44 @@ class _SharedBlockAllocator:
         state["free_count"] = int(state.get("free_count", 0)) - len(out)
         state["next_scan_start"] = int(block_id)
         return out
+
+    def _bump_refcnts(self,
+                      refcnt_mm: mmap.mmap,
+                      block_ids: list[int],
+                      delta: int) -> None:
+        if not block_ids or delta == 0:
+            return
+        view = memoryview(refcnt_mm).cast("I")
+        if delta > 0:
+            for bid in block_ids:
+                view[int(bid)] = int(view[int(bid)] + delta)
+        else:
+            dec = -int(delta)
+            for bid in block_ids:
+                cur = int(view[int(bid)])
+                view[int(bid)] = max(0, cur - dec)
+
+    def attach_existing_request_range(self, request_id: str, start: int,
+                                      end: int) -> list[int]:
+        s = int(start)
+        e = int(end)
+        if e <= s:
+            return []
+        req_key = self.canonical_request_id(request_id)
+
+        def _op(state: dict[str, Any], meta_mm: mmap.mmap, bitmap_mm: mmap.mmap,
+                refcnt_mm: mmap.mmap) -> list[int]:
+            del state, meta_mm, bitmap_mm
+            req_blocks = self._read_req_blocks(req_key)
+            if len(req_blocks) < e:
+                raise RuntimeError(
+                    f"attach_existing_request_range out of range: len={len(req_blocks)} end={e}"
+                )
+            block_ids = [int(x) for x in req_blocks[s:e]]
+            self._bump_refcnts(refcnt_mm, block_ids, 1)
+            return block_ids
+
+        return self._with_lock(_op)
 
     @staticmethod
     def _num_free_from_intervals(intervals: list[list[int]]) -> int:
@@ -457,8 +602,9 @@ class _SharedBlockAllocator:
             req_blocks = self._read_req_blocks(req_key)
             old_len = len(req_blocks)
             if old_len < e:
+                grow_to = max(e, old_len + self._req_growth_chunk)
                 picked = self._alloc_free_blocks(state, bitmap_mm, refcnt_mm,
-                                                 e - old_len)
+                                                 grow_to - old_len)
                 req_blocks.extend(int(x) for x in picked)
                 self._append_req_blocks(req_key, picked)
             for bid in req_blocks[s:min(e, old_len)]:
@@ -497,15 +643,16 @@ class _SharedBlockAllocator:
 
         def _op(state: dict[str, Any], meta_mm: mmap.mmap, bitmap_mm: mmap.mmap,
                 refcnt_mm: mmap.mmap) -> None:
+            view = memoryview(refcnt_mm).cast("I")
             for bid in free_ids:
-                cur = self._get_refcnt(refcnt_mm, bid)
+                cur = int(view[bid])
                 if cur <= 1:
                     if cur == 1:
-                        self._set_refcnt(refcnt_mm, bid, 0)
+                        view[bid] = 0
                         self._set_free_bit(bitmap_mm, bid, True)
                         state["free_count"] = int(state.get("free_count", 0)) + 1
                 else:
-                    self._set_refcnt(refcnt_mm, bid, cur - 1)
+                    view[bid] = cur - 1
             return None
 
         self._with_lock(_op)
@@ -521,15 +668,16 @@ class _SharedBlockAllocator:
 
         def _op(state: dict[str, Any], meta_mm: mmap.mmap, bitmap_mm: mmap.mmap,
                 refcnt_mm: mmap.mmap) -> None:
+            view = memoryview(refcnt_mm).cast("I")
             for bid in free_ids:
-                cur = self._get_refcnt(refcnt_mm, bid)
+                cur = int(view[bid])
                 if cur <= 1:
                     if cur == 1:
-                        self._set_refcnt(refcnt_mm, bid, 0)
+                        view[bid] = 0
                         self._set_free_bit(bitmap_mm, bid, True)
                         state["free_count"] = int(state.get("free_count", 0)) + 1
                 else:
-                    self._set_refcnt(refcnt_mm, bid, cur - 1)
+                    view[bid] = cur - 1
             if terminal:
                 self._delete_req_blocks(req_key)
             return None
@@ -686,29 +834,15 @@ class BlockPool:
         self.kv_event_queue: list[KVCacheEvent] = []
 
         self._shared_allocator: Optional[_SharedBlockAllocator] = None
+        self._post_cutover_local_tail_ids: dict[str, set[int]] = {}
         shared_enable = os.getenv("VLLM_SHARED_BLOCK_ALLOCATOR_ENABLE",
                                   "").strip().lower() in {
                                       "1", "true", "yes", "on"
                                   }
         if shared_enable:
-            # Keep key stable for processes that target the same physical GPU.
             key = os.getenv("VLLM_SHARED_BLOCK_ALLOCATOR_KEY", "").strip()
             if not key:
-                cvd = os.getenv("CUDA_VISIBLE_DEVICES", "all")
-                key = f"{cvd}__lr{os.getenv('LOCAL_RANK', '0')}"
-                # Prefer runtime CUDA device identity when available.
-                try:
-                    import torch  # local import to avoid hard dependency here
-                    if torch.cuda.is_available():
-                        local_idx = int(torch.cuda.current_device())
-                        phys = str(local_idx)
-                        if cvd and cvd != "all":
-                            parts = [x.strip() for x in cvd.split(",")]
-                            if 0 <= local_idx < len(parts):
-                                phys = parts[local_idx]
-                        key = f"gpu{phys}"
-                except Exception:
-                    pass
+                key = _resolve_shared_allocator_key()
             path = os.getenv("VLLM_SHARED_BLOCK_ALLOCATOR_PATH",
                              "/tmp/vllm_shared_block_allocator").strip()
             reset = os.getenv("VLLM_SHARED_BLOCK_ALLOCATOR_RESET",
@@ -720,8 +854,15 @@ class BlockPool:
                     num_gpu_blocks=num_gpu_blocks,
                     reset=reset,
                 )
-                logger.info("shared block allocator enabled key=%s path=%s",
-                            key, path)
+                logger.info(
+                    "shared block allocator enabled key=%s path=%s local_rank=%s tp_rank=%s rank=%s cvd=%s",
+                    key,
+                    path,
+                    os.getenv("LOCAL_RANK", ""),
+                    _get_env_first("VLLM_TP_RANK", "TENSOR_PARALLEL_RANK"),
+                    os.getenv("RANK", ""),
+                    os.getenv("CUDA_VISIBLE_DEVICES", ""),
+                )
             except Exception as e:
                 logger.warning(
                     "failed to enable shared block allocator, fallback to local pool: %s",
@@ -904,11 +1045,56 @@ class BlockPool:
         # table so both servers resolve the same canonical request range.
         return self._shared_allocator.is_handoff_request_id(request_id)
 
+    def _is_post_cutover_consumer(self, request_id: Optional[str]) -> bool:
+        if not request_id or self._shared_allocator is None:
+            return False
+        rid = str(request_id)
+        return (self._shared_allocator.is_post_cutover_request_id(rid)
+                and self._shared_allocator.is_terminal_request_id(rid))
+
     def get_new_blocks_for_request(self, request_id: str, start: int,
                                    end: int) -> list[KVCacheBlock]:
         num = max(0, int(end) - int(start))
         if not self._use_shared_for_request(request_id):
             return self._get_new_blocks_local(num)
+        if self._is_post_cutover_consumer(request_id):
+            req_key = self._shared_allocator.canonical_request_id(request_id)
+            shared_prefix_ids = self._shared_allocator._read_req_blocks(req_key)
+            shared_len = len(shared_prefix_ids)
+            local_tail_ids = self._post_cutover_local_tail_ids.setdefault(
+                req_key, set())
+
+            shared_start = int(start)
+            shared_end = min(int(end), shared_len)
+            ret: list[KVCacheBlock] = []
+            shared_blocks: list[KVCacheBlock] = []
+            if shared_end > shared_start:
+                block_ids = self._shared_allocator.attach_existing_request_range(
+                    request_id, shared_start, shared_end)
+                for bid in block_ids:
+                    block = self.blocks[bid]
+                    if block.ref_cnt == 0 and not block.is_null:
+                        self._remove_from_local_free_queue_if_present(block)
+                    shared_blocks.append(block)
+                if self.enable_caching:
+                    for block in shared_blocks:
+                        self._maybe_evict_cached_block(block)
+                        block.ref_cnt += 1
+                else:
+                    for block in shared_blocks:
+                        block.ref_cnt += 1
+                ret.extend(shared_blocks)
+
+            if int(end) > shared_len:
+                local_needed_start = max(int(start), shared_len)
+                local_needed = int(end) - local_needed_start
+                if local_needed > 0:
+                    local_blocks = self._get_new_blocks_local(local_needed)
+                    for block in local_blocks:
+                        local_tail_ids.add(block.block_id)
+                    ret.extend(local_blocks)
+
+            return ret
         block_ids = self._shared_allocator.allocate_request_range(
             request_id, int(start), int(end))
         ret: list[KVCacheBlock] = []
@@ -1022,14 +1208,35 @@ class BlockPool:
         self.free_block_queue.append_n(released_blocks)
         if self._shared_allocator is not None and released_blocks and \
                 self._use_shared_for_request(request_id):
+            req_key = (self._shared_allocator.canonical_request_id(request_id)
+                       if request_id else "")
+            local_tail_ids = self._post_cutover_local_tail_ids.get(req_key, set())
             block_ids = [block.block_id for block in released_blocks]
+            if local_tail_ids and request_id and self._is_post_cutover_consumer(
+                    request_id):
+                shared_block_ids = [
+                    bid for bid in block_ids if bid not in local_tail_ids
+                ]
+                local_block_ids = [
+                    bid for bid in block_ids if bid in local_tail_ids
+                ]
+                if local_block_ids:
+                    for bid in local_block_ids:
+                        local_tail_ids.discard(bid)
+                    if not local_tail_ids:
+                        self._post_cutover_local_tail_ids.pop(req_key, None)
+                block_ids = shared_block_ids
             if request_id:
-                self._shared_allocator.release_request_blocks(
-                    request_id=request_id,
-                    block_ids=block_ids,
-                    terminal=self._shared_allocator.is_terminal_request_id(
-                        request_id),
-                )
+                if block_ids:
+                    self._shared_allocator.release_request_blocks(
+                        request_id=request_id,
+                        block_ids=block_ids,
+                        terminal=self._shared_allocator.is_terminal_request_id(
+                            request_id),
+                    )
+                elif request_id and self._shared_allocator.is_terminal_request_id(
+                        request_id):
+                    self._post_cutover_local_tail_ids.pop(req_key, None)
             else:
                 self._shared_allocator.release(block_ids)
 
@@ -1083,6 +1290,8 @@ class BlockPool:
         - post-cutover/shared requests: use shared allocator view
         """
         if not self._use_shared_for_request(request_id):
+            return int(self.free_block_queue.num_free_blocks)
+        if self._is_post_cutover_consumer(request_id):
             return int(self.free_block_queue.num_free_blocks)
         try:
             return int(self._shared_allocator.num_free_blocks()

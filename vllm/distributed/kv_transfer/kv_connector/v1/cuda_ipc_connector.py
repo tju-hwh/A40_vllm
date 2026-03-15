@@ -80,6 +80,11 @@ class CudaIpcConnector(KVConnectorBase_V1):
     def __init__(self, vllm_config: "VllmConfig", role: KVConnectorRole):
         super().__init__(vllm_config=vllm_config, role=role)
         self._block_size = vllm_config.cache_config.block_size
+        self._parallel_config = vllm_config.parallel_config
+        self._tp_size = max(1, int(self._parallel_config.tensor_parallel_size))
+        self._global_rank = int(getattr(self._parallel_config, "rank", 0))
+        self._tp_rank = self._global_rank % self._tp_size
+        self._tp_primary = self._tp_rank == 0
         self._requests_need_load: dict[str, Any] = {}
         # Producer-side rolling state of full block ids for decode handoff.
         self._send_req_blocks: dict[str, list[int]] = {}
@@ -160,6 +165,16 @@ class CudaIpcConnector(KVConnectorBase_V1):
             transfer_config.get_from_extra_config("handoff_pin_s", 1.5))
         self._deferred_finished_until: dict[str, float] = {}
         self._global_tensor_map_cache: Optional[dict[str, str]] = None
+        logger.info(
+            "cuda_ipc connector init can_send=%s can_recv=%s zero_copy=%s rank=%s tp_rank=%s tp_size=%s tp_primary=%s",
+            self.can_send,
+            self.can_recv,
+            self._zero_copy_shared_pool_mode,
+            self._global_rank,
+            self._tp_rank,
+            self._tp_size,
+            self._tp_primary,
+        )
 
     # ==============================
     # Worker-side methods
@@ -207,6 +222,8 @@ class CudaIpcConnector(KVConnectorBase_V1):
                       **kwargs: Any) -> None:
         del kwargs
         if not self.can_recv:
+            return
+        if self._zero_copy_shared_pool_mode and not self._tp_primary:
             return
         if self._connector_metadata is None:
             return
@@ -585,6 +602,8 @@ class CudaIpcConnector(KVConnectorBase_V1):
             self._owner_flush_register_kv()
 
     def wait_for_save(self):
+        if self._zero_copy_shared_pool_mode and not self._tp_primary:
+            return
         self._owner_flush_register_kv()
         return
 
@@ -592,6 +611,8 @@ class CudaIpcConnector(KVConnectorBase_V1):
             self, finished_req_ids: set[str],
             **kwargs: Any) -> tuple[Optional[set[str]], Optional[set[str]]]:
         del kwargs
+        if self._zero_copy_shared_pool_mode and not self._tp_primary:
+            return None, None
         # Only report producer-side async sends that have actually matured.
         # Ordinary completed requests must not be surfaced as
         # "finished_sending", otherwise the scheduler treats consumer-side
@@ -637,16 +658,23 @@ class CudaIpcConnector(KVConnectorBase_V1):
     def update_state_after_alloc(self, request: "Request",
                                  blocks: "KVCacheBlocks",
                                  num_external_tokens: int):
+        del blocks
         if self.can_recv and self.has_prefill_addr(
                 request.request_id) and num_external_tokens > 0:
+            if self._zero_copy_shared_pool_mode and not self._tp_primary:
+                self._recv_loaded_once.add(
+                    self.normalize_request_id(request.request_id))
+                return
             self._requests_need_load[request.request_id] = (
-                request, blocks.get_block_ids()[0])
+                request, None)
 
     def build_connector_meta(
         self,
         scheduler_output: SchedulerOutput,
     ) -> KVConnectorMetadata:
         meta = CudaIpcConnectorMetadata()
+        if self._zero_copy_shared_pool_mode and not self._tp_primary:
+            return meta
         seen_req_ids: set[str] = set()
 
         def _first_group_block_ids(
@@ -757,7 +785,8 @@ class CudaIpcConnector(KVConnectorBase_V1):
         block_ids: list[int],
     ) -> tuple[bool, Optional[dict[str, Any]]]:
         if (self.can_send and self._zero_copy_shared_pool_mode
-                and self.has_decode_addr(request.request_id)):
+                and self.has_decode_addr(request.request_id)
+                and self._tp_primary):
             total_tokens = len(getattr(request, "all_token_ids", []))
             base_req = self.base_request_id(request.request_id)
             global_tensor_map = self._load_global_tensor_map()
@@ -913,6 +942,10 @@ class CudaIpcConnector(KVConnectorBase_V1):
 
     def should_build_connector_meta(
             self, scheduler_output: SchedulerOutput) -> bool:
+        if self._zero_copy_shared_pool_mode and not self._tp_primary:
+            return False
+        if self._zero_copy_shared_pool_mode and self.can_recv and not self._tp_primary:
+            return False
         if self.can_recv and self._requests_need_load:
             return True
         if self._zero_copy_shared_pool_mode and self.can_send and not self.can_recv:
