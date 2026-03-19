@@ -69,9 +69,39 @@ def main() -> int:
     parser.add_argument("--server3-url", default="http://127.0.0.1:8103")
     parser.add_argument("--server4-url", default="http://127.0.0.1:8104")
     parser.add_argument(
+        "--server1-urls",
+        default="",
+        help="Optional CSV of shard URLs for logical server1 stage.",
+    )
+    parser.add_argument(
+        "--server2-urls",
+        default="",
+        help="Optional CSV of shard URLs for logical server2 stage.",
+    )
+    parser.add_argument(
+        "--server3-urls",
+        default="",
+        help="Optional CSV of shard URLs for logical server3 stage.",
+    )
+    parser.add_argument(
+        "--server4-urls",
+        default="",
+        help="Optional CSV of shard URLs for logical server4 stage.",
+    )
+    parser.add_argument(
         "--server-kv-ports",
         default="18101,18102,18103,18104",
         help="Comma-separated KV connector ports aligned with enabled server URLs.",
+    )
+    parser.add_argument(
+        "--server-kv-port-groups",
+        default="",
+        help="Optional semicolon-separated KV port groups aligned with logical stages.",
+    )
+    parser.add_argument(
+        "--server-dp-sizes",
+        default="1,1,1,1",
+        help="Comma-separated DP sizes aligned with enabled server URLs.",
     )
     parser.add_argument(
         "--routing-mode",
@@ -156,19 +186,41 @@ def main() -> int:
 
     env = dict(os.environ)
     env["PROXY_ROLE"] = "ingress"
-    env["PRIMARY_UPSTREAM"] = args.server1_url.rstrip("/")
-    all_targets = [
-        args.server1_url.rstrip("/"),
-        args.server2_url.rstrip("/"),
-        args.server3_url.rstrip("/"),
-        args.server4_url.rstrip("/"),
+    def _parse_group(urls_value: str, fallback_url: str) -> list[str]:
+        raw = urls_value.strip()
+        if raw:
+            return [x.strip().rstrip("/") for x in raw.split(",") if x.strip()]
+        return [fallback_url.rstrip("/")]
+
+    grouped_targets = [
+        _parse_group(args.server1_urls, args.server1_url),
+        _parse_group(args.server2_urls, args.server2_url),
+        _parse_group(args.server3_urls, args.server3_url),
+        _parse_group(args.server4_urls, args.server4_url),
     ]
+    env["PRIMARY_UPSTREAM"] = grouped_targets[0][0]
+    all_targets = [group[0] for group in grouped_targets]
     active_targets = all_targets[: args.num_servers]
     env["ALT_UPSTREAMS"] = ",".join(active_targets[1:])
     env["ROUTING_MODE"] = args.routing_mode
     env["SEQUENTIAL_BLOCK_SIZE"] = str(args.block_size)
     env["SEQUENTIAL_TARGETS"] = ",".join(active_targets)
-    env["SEQUENTIAL_TARGET_KV_PORTS"] = args.server_kv_ports
+    active_groups = grouped_targets[: args.num_servers]
+    env["SEQUENTIAL_TARGET_GROUPS"] = ";".join(
+        ",".join(group) for group in active_groups
+    )
+
+    if args.server_kv_port_groups.strip():
+        env["SEQUENTIAL_TARGET_KV_PORT_GROUPS"] = args.server_kv_port_groups
+    else:
+        env["SEQUENTIAL_TARGET_KV_PORTS"] = args.server_kv_ports
+
+    if args.server_dp_sizes.strip():
+        env["SEQUENTIAL_TARGET_DP_SIZES"] = args.server_dp_sizes
+    else:
+        env["SEQUENTIAL_TARGET_DP_SIZES"] = ",".join(
+            str(len(group)) for group in active_groups
+        )
     env["SEQUENTIAL_DECODE_TOKENS"] = args.decode_cutovers
     env["REQUEST_TIMEOUT_S"] = str(args.request_timeout_s)
     env["CONNECT_TIMEOUT_S"] = str(args.connect_timeout_s)
@@ -182,7 +234,9 @@ def main() -> int:
     env["KV_OWNER_STATE_URL"] = args.kv_owner_state_url
     env["KV_OWNER_STATE_STRICT"] = "1" if args.kv_owner_state_strict else "0"
 
-    upstreams = active_targets
+    upstreams = []
+    for group in active_groups:
+        upstreams.extend(group)
     if not args.skip_wait_upstreams_ready:
         _wait_upstreams_ready(upstreams, args.wait_upstreams_ready_timeout_s)
     else:
@@ -218,7 +272,7 @@ def main() -> int:
         f"  upstream max model len: {args.upstream_max_model_len}\n"
         f"  dynamic kv control path: {args.dynamic_kv_control_path or '(disabled)'}\n"
         f"  kv owner state url: {args.kv_owner_state_url or '(disabled)'}\n"
-        f"  targets: {', '.join(active_targets)}\n"
+        f"  targets: {'; '.join(', '.join(group) for group in active_groups)}\n"
     )
     if args.routing_mode == "sequential_blocks":
         print(f"Policy: decode requests are assigned across {args.num_servers} servers in sequential blocks.")

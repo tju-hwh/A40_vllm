@@ -316,6 +316,7 @@ class OpenAIServingChat(OpenAIServing):
                         lora_request=lora_request,
                         trace_headers=trace_headers,
                         priority=request.priority,
+                        data_parallel_rank=request.data_parallel_rank,
                     )
 
                 generators.append(generator)

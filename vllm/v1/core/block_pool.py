@@ -684,6 +684,41 @@ class _SharedBlockAllocator:
 
         self._with_lock(_op)
 
+    def reset_all(self) -> None:
+        def _op(state: dict[str, Any], meta_mm: mmap.mmap, bitmap_mm: mmap.mmap,
+                refcnt_mm: mmap.mmap) -> None:
+            self._req_cache.clear()
+            for req_key in list(self._req_mmaps.keys()):
+                self._close_req_mmap(req_key)
+            if os.path.isdir(self._req_dir):
+                for name in os.listdir(self._req_dir):
+                    path = os.path.join(self._req_dir, name)
+                    if os.path.isfile(path):
+                        try:
+                            os.remove(path)
+                        except OSError:
+                            pass
+
+            bitmap_size = len(bitmap_mm)
+            if bitmap_size > 0:
+                bitmap_mm[:] = b"\xff" * bitmap_size
+            self._set_free_bit(bitmap_mm, 0, False)
+            for block_id in range(self._num_gpu_blocks, bitmap_size * 8):
+                self._set_free_bit(bitmap_mm, block_id, False)
+
+            view = memoryview(refcnt_mm).cast("I")
+            for idx in range(len(view)):
+                view[idx] = 0
+            if len(view) > 0:
+                view[0] = 1
+
+            state["num_gpu_blocks"] = self._num_gpu_blocks
+            state["free_count"] = max(0, self._num_gpu_blocks - 1)
+            state["next_scan_start"] = 1
+            return None
+
+        self._with_lock(_op)
+
     def num_free_blocks(self) -> int:
         def _op(state: dict[str, Any]) -> int:
             return int(state.get("free_count", 0))
@@ -1268,6 +1303,30 @@ class BlockPool:
         if self.enable_kv_cache_events:
             self.kv_event_queue.append(AllBlocksCleared())
 
+        return True
+
+    def reset_hop_state(self) -> bool:
+        self.cached_block_hash_to_block = BlockHashToBlockMap()
+        self._post_cutover_local_tail_ids.clear()
+
+        for block in self.blocks:
+            block.ref_cnt = 0
+            block.reset_hash()
+            block.prev_free_block = None
+            block.next_free_block = None
+            block.is_null = False
+
+        if self._shared_allocator is not None:
+            self._shared_allocator.reset_all()
+
+        self.free_block_queue = FreeKVCacheBlockQueue(self.blocks)
+        self.null_block = self.free_block_queue.popleft()
+        self.null_block.is_null = True
+        self.null_block.ref_cnt = 1
+
+        if self.enable_kv_cache_events:
+            self.kv_event_queue.append(AllBlocksCleared())
+        logger.info("Successfully reset hop block pool state")
         return True
 
     def get_num_free_blocks(self) -> int:

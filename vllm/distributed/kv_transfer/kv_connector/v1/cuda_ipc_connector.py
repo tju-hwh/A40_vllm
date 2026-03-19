@@ -844,7 +844,7 @@ class CudaIpcConnector(KVConnectorBase_V1):
         # Only strip a trailing rank suffix when the ID already contains our
         # injected peer-address markers and the suffix is appended at the end.
         m = re.search(
-            r"(___(?:decode|prefill)_addr_[^:]+:\d+)(-\d+)$",
+            r"(___(?:decode|prefill)_addr_[^:]+:\d+(?:@dp\d+)?)(-\d+)$",
             rid,
         )
         if m:
@@ -859,13 +859,13 @@ class CudaIpcConnector(KVConnectorBase_V1):
     @staticmethod
     def has_prefill_addr(request_id: str) -> bool:
         request_id = CudaIpcConnector.normalize_request_id(request_id)
-        return re.search(r"___prefill_addr_([^:]+):(\d+)___",
+        return re.search(r"___prefill_addr_([^:]+):(\d+)(?:@dp(\d+))?___",
                          request_id) is not None
 
     @staticmethod
     def has_decode_addr(request_id: str) -> bool:
         request_id = CudaIpcConnector.normalize_request_id(request_id)
-        return re.search(r"___decode_addr_([^:]+):(\d+)$",
+        return re.search(r"___decode_addr_([^:]+):(\d+)(?:@dp(\d+))?$",
                          request_id) is not None
 
     def _meta_file_path(self, tensor_key: str) -> str:
@@ -990,12 +990,18 @@ class CudaIpcConnector(KVConnectorBase_V1):
 
     def _decode_worker_from_req(self, request_id: str) -> str:
         req = self.normalize_request_id(request_id)
-        m = re.search(r"___decode_addr_([^:]+):(\d+)$", req)
+        m = re.search(r"___decode_addr_([^:]+):(\d+)(?:@dp(\d+))?$", req)
         if m:
-            return f"http://{m.group(1)}:{m.group(2)}"
-        m = re.search(r"___prefill_addr_([^:]+):(\d+)___", req)
+            worker = f"http://{m.group(1)}:{m.group(2)}"
+            if m.group(3) is not None:
+                worker += f"#dp{m.group(3)}"
+            return worker
+        m = re.search(r"___prefill_addr_([^:]+):(\d+)(?:@dp(\d+))?___", req)
         if m:
-            return f"http://{m.group(1)}:{m.group(2)}"
+            worker = f"http://{m.group(1)}:{m.group(2)}"
+            if m.group(3) is not None:
+                worker += f"#dp{m.group(3)}"
+            return worker
         return ""
 
     def _global_tensor_map_path(self) -> str:

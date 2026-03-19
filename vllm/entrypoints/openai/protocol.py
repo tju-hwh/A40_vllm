@@ -458,6 +458,13 @@ class ChatCompletionRequest(OpenAIBaseModel):
     # NOTE this will be ignored by vLLM -- the model determines the behavior
     parallel_tool_calls: Optional[bool] = False
     user: Optional[str] = None
+    data_parallel_rank: Optional[int] = Field(
+        default=None,
+        description=(
+            "Optional data parallel rank override. When set, the request is "
+            "routed to that DP engine instead of using the server's load balancer."
+        ),
+    )
 
     # --8<-- [start:chat-completion-sampling-params]
     best_of: Optional[int] = None
@@ -604,6 +611,13 @@ class ChatCompletionRequest(OpenAIBaseModel):
             "The request_id related to this request. If the caller does "
             "not set it, a random_uuid will be generated. This id is used "
             "through out the inference process and return in response."),
+    )
+    data_parallel_rank: Optional[int] = Field(
+        default=None,
+        description=(
+            "Optional data parallel rank override. When set, the request is "
+            "routed to that DP engine instead of using the server's load balancer."
+        ),
     )
     logits_processors: Optional[LogitsProcessors] = Field(
         default=None,
@@ -1136,6 +1150,13 @@ class CompletionRequest(OpenAIBaseModel):
             "The request_id related to this request. If the caller does "
             "not set it, a random_uuid will be generated. This id is used "
             "through out the inference process and return in response."),
+    )
+    data_parallel_rank: Optional[int] = Field(
+        default=None,
+        description=(
+            "Optional data parallel rank override. When set, the request is "
+            "routed to that DP engine instead of using the server's load balancer."
+        ),
     )
     logits_processors: Optional[LogitsProcessors] = Field(
         default=None,

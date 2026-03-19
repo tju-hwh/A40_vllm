@@ -71,6 +71,7 @@ def _build_vllm_cmd(
     enforce_eager: bool | None = None,
     compilation_config: str | None = None,
     tensor_parallel_size: int | None = None,
+    data_parallel_size: int | None = None,
     kv_transfer_config: str | None = None,
 ) -> list[str]:
     cmd = [
@@ -100,6 +101,8 @@ def _build_vllm_cmd(
         cmd += ["--compilation-config", compilation_config]
     if tensor_parallel_size is not None:
         cmd += ["--tensor-parallel-size", str(tensor_parallel_size)]
+    if data_parallel_size is not None:
+        cmd += ["--data-parallel-size", str(data_parallel_size)]
     if kv_transfer_config:
         cmd += ["--kv-transfer-config", kv_transfer_config]
     cmd += extra_args
@@ -172,6 +175,36 @@ def _parse_csv_ints(raw: str) -> list[int]:
     for item in _parse_csv(raw):
         vals.append(int(item))
     return vals
+
+
+def _split_visible_devices(raw: str, tp_size: int,
+                           dp_size: int, role: str) -> list[str]:
+    devices = _parse_csv(raw)
+    if tp_size <= 0 or dp_size <= 0:
+        raise ValueError(f"{role}: tp_size and dp_size must be > 0")
+    need = tp_size * dp_size
+    if len(devices) < need:
+        raise ValueError(
+            f"{role}: CUDA_VISIBLE_DEVICES needs at least {need} devices for "
+            f"tp={tp_size}, dp={dp_size}, got {devices!r}"
+        )
+    shards: list[str] = []
+    for idx in range(dp_size):
+        start = idx * tp_size
+        shard = devices[start:start + tp_size]
+        shards.append(",".join(shard))
+    return shards
+
+
+def _logical_stage_ports(base_port: int, dp_size: int) -> list[int]:
+    return [base_port + 2 * idx for idx in range(dp_size)]
+
+
+def _shared_meta_path_for_shard(base_meta_path: str, dp_idx: int,
+                                external_dp: bool) -> str:
+    if not external_dp:
+        return base_meta_path
+    return f"{base_meta_path}.dp{dp_idx}"
 
 
 def _resolve_kv_transfer_config(raw: str | None,
@@ -298,6 +331,12 @@ def main() -> int:
         help="Owner server --tensor-parallel-size.",
     )
     parser.add_argument(
+        "--owner-data-parallel-size",
+        type=int,
+        default=1,
+        help="Owner server --data-parallel-size.",
+    )
+    parser.add_argument(
         "--owner-compilation-config",
         default="",
         help=(
@@ -328,6 +367,12 @@ def main() -> int:
         type=int,
         default=1,
         help="Consumer server --tensor-parallel-size.",
+    )
+    parser.add_argument(
+        "--consumer-data-parallel-size",
+        type=int,
+        default=1,
+        help="Consumer server --data-parallel-size.",
     )
     parser.add_argument(
         "--no-consumer-enforce-eager",
@@ -538,6 +583,45 @@ def main() -> int:
     all_ports = [args.server1_port, args.server2_port, args.server3_port, args.server4_port]
     ports = all_ports[: args.num_servers]
     urls = [f"http://127.0.0.1:{p}" for p in ports]
+    owner_external_dp = args.owner_data_parallel_size > 1
+    consumer_external_dp = args.consumer_data_parallel_size > 1
+    if owner_external_dp or consumer_external_dp:
+        if args.num_servers != 2:
+            raise ValueError(
+                "External DP shard mode is currently only supported for num-servers=2"
+            )
+        if args.owner_data_parallel_size != args.consumer_data_parallel_size:
+            raise ValueError(
+                "External DP shard mode requires owner/consumer data parallel "
+                "sizes to match"
+            )
+        if not args.owner_cuda_visible_devices:
+            raise ValueError(
+                "External DP shard mode requires --owner-cuda-visible-devices"
+            )
+        consumer_cvd = args.consumer_cuda_visible_devices_all or args.owner_cuda_visible_devices
+        owner_shards = _split_visible_devices(
+            args.owner_cuda_visible_devices,
+            args.owner_tensor_parallel_size,
+            args.owner_data_parallel_size,
+            "owner",
+        )
+        consumer_shards = _split_visible_devices(
+            consumer_cvd,
+            args.consumer_tensor_parallel_size,
+            args.consumer_data_parallel_size,
+            "consumer",
+        )
+        owner_ports = _logical_stage_ports(args.server1_port,
+                                           args.owner_data_parallel_size)
+        consumer_ports_external = _logical_stage_ports(args.server2_port,
+                                                       args.consumer_data_parallel_size)
+        urls = [f"http://127.0.0.1:{p}" for p in owner_ports + consumer_ports_external]
+    else:
+        owner_shards = []
+        consumer_shards = []
+        owner_ports = [args.server1_port]
+        consumer_ports_external = ports[1:]
 
     try:
         os.remove(args.ipc_meta_path)
@@ -570,65 +654,85 @@ def main() -> int:
     signal.signal(signal.SIGINT, _sig_handler)
     signal.signal(signal.SIGTERM, _sig_handler)
 
-    owner_cmd = _build_vllm_cmd(
-        host=host,
-        port=args.server1_port,
-        model=args.model,
-        role="owner",
-        meta_path=args.ipc_meta_path,
-        timeout_s=args.ipc_wait_timeout_s,
-        poll_s=args.ipc_poll_interval_s,
-        extra_args=_strip_overridden_args(
-            vllm_extra,
-            {
-                "--gpu-memory-utilization",
-                "--max-num-seqs",
-                "--max-model-len",
-                "--tensor-parallel-size",
-                "--kv-transfer-config",
-            },
-        ),
-        gpu_memory_utilization=args.owner_gpu_memory_utilization,
-        max_num_seqs=args.owner_max_num_seqs,
-        max_model_len=args.owner_max_model_len,
-        compilation_config=(args.owner_compilation_config or None),
-        tensor_parallel_size=args.owner_tensor_parallel_size,
-        kv_transfer_config=_resolve_kv_transfer_config(
-            args.owner_kv_transfer_config or args.kv_transfer_config_template,
-            args.server1_port,
-            args.kv_owner_state_url,
-            args.shared_kv_pool_enable,
-            args.shared_kv_pool_meta_path,
-            args.shared_kv_pool_wait_timeout_s,
-            args.shared_kv_pool_poll_s,
-            "producer",
-            args.send_activation_margin_tokens,
-            args.send_publish_token_stride,
-            args.owner_flush_each_layer,
-        ),
+    owner_extra = _strip_overridden_args(
+        vllm_extra,
+        {
+            "--gpu-memory-utilization",
+            "--max-num-seqs",
+            "--max-model-len",
+            "--tensor-parallel-size",
+            "--data-parallel-size",
+            "--kv-transfer-config",
+        },
     )
-    owner_env = dict(base_env)
-    if args.owner_cuda_visible_devices:
-        owner_env["CUDA_VISIBLE_DEVICES"] = args.owner_cuda_visible_devices
-    if args.enable_cuda_mps:
-        owner_env["CUDA_MPS_ACTIVE_THREAD_PERCENTAGE"] = str(mps_percentages[0])
-    if args.shared_kv_pool_enable:
-        owner_env["VLLM_SHARED_BLOCK_ALLOCATOR_ENABLE"] = "1"
-        owner_env["VLLM_SHARED_BLOCK_ALLOCATOR_PATH"] = (
-            args.shared_kv_pool_meta_path + ".alloc")
-        owner_env["VLLM_SHARED_BLOCK_ALLOCATOR_RESET"] = "1"
-    children.append(_start(owner_cmd, owner_env))
+
+    def _owner_env(dp_idx: int) -> dict[str, str]:
+        env = dict(base_env)
+        env["VLLM_SERVER_DEV_MODE"] = env.get("VLLM_SERVER_DEV_MODE", "1")
+        if owner_external_dp:
+            env["CUDA_VISIBLE_DEVICES"] = owner_shards[dp_idx]
+        elif args.owner_cuda_visible_devices:
+            env["CUDA_VISIBLE_DEVICES"] = args.owner_cuda_visible_devices
+        if args.enable_cuda_mps:
+            env["CUDA_MPS_ACTIVE_THREAD_PERCENTAGE"] = str(mps_percentages[0])
+        if args.shared_kv_pool_enable:
+            shard_meta_path = _shared_meta_path_for_shard(
+                args.shared_kv_pool_meta_path, dp_idx, owner_external_dp)
+            env["VLLM_SHARED_BLOCK_ALLOCATOR_ENABLE"] = "1"
+            env["VLLM_SHARED_BLOCK_ALLOCATOR_PATH"] = shard_meta_path + ".alloc"
+            env["VLLM_SHARED_BLOCK_ALLOCATOR_RESET"] = "1"
+        return env
+
+    def _owner_cmd(port: int, dp_idx: int) -> list[str]:
+        shard_meta_path = _shared_meta_path_for_shard(
+            args.shared_kv_pool_meta_path, dp_idx, owner_external_dp)
+        return _build_vllm_cmd(
+            host=host,
+            port=port,
+            model=args.model,
+            role="owner",
+            meta_path=args.ipc_meta_path,
+            timeout_s=args.ipc_wait_timeout_s,
+            poll_s=args.ipc_poll_interval_s,
+            extra_args=owner_extra,
+            gpu_memory_utilization=args.owner_gpu_memory_utilization,
+            max_num_seqs=args.owner_max_num_seqs,
+            max_model_len=args.owner_max_model_len,
+            compilation_config=(args.owner_compilation_config or None),
+            tensor_parallel_size=args.owner_tensor_parallel_size,
+            data_parallel_size=None if owner_external_dp
+            else args.owner_data_parallel_size,
+            kv_transfer_config=_resolve_kv_transfer_config(
+                args.owner_kv_transfer_config or args.kv_transfer_config_template,
+                port,
+                args.kv_owner_state_url,
+                args.shared_kv_pool_enable,
+                shard_meta_path,
+                args.shared_kv_pool_wait_timeout_s,
+                args.shared_kv_pool_poll_s,
+                "producer",
+                args.send_activation_margin_tokens,
+                args.send_publish_token_stride,
+                args.owner_flush_each_layer,
+            ),
+        )
+
+    for owner_dp_idx, owner_port in enumerate(owner_ports):
+        children.append(
+            _start(_owner_cmd(owner_port, owner_dp_idx),
+                   _owner_env(owner_dp_idx)))
     time.sleep(args.owner_startup_delay_s)
-    owner_url = f"http://127.0.0.1:{args.server1_port}"
     try:
-        _wait_owner_ready(owner_url, args.owner_ready_timeout_s)
+        for owner_port in owner_ports:
+            _wait_owner_ready(f"http://127.0.0.1:{owner_port}",
+                              args.owner_ready_timeout_s)
     except Exception as e:
         print(f"Owner failed to become ready: {e}")
         _stop_all(children)
         return 1
 
     consumer_visible_devices = _parse_csv(args.consumer_cuda_visible_devices)
-    consumer_ports = ports[1:]
+    consumer_ports = consumer_ports_external
     consumer_extra = _strip_overridden_args(
         vllm_extra,
         {
@@ -643,33 +747,44 @@ def main() -> int:
 
     def _consumer_env(idx: int) -> dict[str, str]:
         env = dict(base_env)
-        if args.consumer_cuda_visible_devices_all:
+        env["VLLM_SERVER_DEV_MODE"] = env.get("VLLM_SERVER_DEV_MODE", "1")
+        if consumer_external_dp:
+            env["CUDA_VISIBLE_DEVICES"] = consumer_shards[idx]
+        elif args.consumer_cuda_visible_devices_all:
             env["CUDA_VISIBLE_DEVICES"] = args.consumer_cuda_visible_devices_all
         elif idx < len(consumer_visible_devices):
             env["CUDA_VISIBLE_DEVICES"] = consumer_visible_devices[idx]
         if args.enable_cuda_mps:
-            env["CUDA_MPS_ACTIVE_THREAD_PERCENTAGE"] = str(
-                mps_percentages[idx + 1]
+            consumer_pct = (
+                mps_percentages[1]
+                if consumer_external_dp else mps_percentages[idx + 1]
             )
+            env["CUDA_MPS_ACTIVE_THREAD_PERCENTAGE"] = str(consumer_pct)
         if args.consumer_attention_backend:
             env["VLLM_ATTENTION_BACKEND"] = args.consumer_attention_backend
         if args.shared_kv_pool_enable:
+            shard_meta_path = _shared_meta_path_for_shard(
+                args.shared_kv_pool_meta_path, idx, consumer_external_dp)
             env["VLLM_SHARED_BLOCK_ALLOCATOR_ENABLE"] = "1"
-            env["VLLM_SHARED_BLOCK_ALLOCATOR_PATH"] = (
-                args.shared_kv_pool_meta_path + ".alloc")
+            env["VLLM_SHARED_BLOCK_ALLOCATOR_PATH"] = shard_meta_path + ".alloc"
             env["VLLM_SHARED_BLOCK_ALLOCATOR_RESET"] = "0"
         return env
 
-    def _consumer_cmd(port: int, active_profile: bool) -> list[str]:
+    def _consumer_cmd(port: int, active_profile: bool, dp_idx: int) -> list[str]:
         gpu_util = args.active_consumer_gpu_memory_utilization if active_profile \
             else args.consumer_gpu_memory_utilization
         max_num_seqs = args.active_consumer_max_num_seqs if active_profile \
             else args.consumer_max_num_seqs
-        per_server_comp_cfg = {
-            args.server2_port: args.server2_compilation_config,
-            args.server3_port: args.server3_compilation_config,
-            args.server4_port: args.server4_compilation_config,
-        }.get(port, "")
+        shard_meta_path = _shared_meta_path_for_shard(
+            args.shared_kv_pool_meta_path, dp_idx, consumer_external_dp)
+        if consumer_external_dp:
+            per_server_comp_cfg = args.server2_compilation_config
+        else:
+            per_server_comp_cfg = {
+                args.server2_port: args.server2_compilation_config,
+                args.server3_port: args.server3_compilation_config,
+                args.server4_port: args.server4_compilation_config,
+            }.get(port, "")
         comp_cfg = per_server_comp_cfg or args.consumer_compilation_config
         return _build_vllm_cmd(
             host=host,
@@ -686,12 +801,14 @@ def main() -> int:
             enforce_eager=not args.no_consumer_enforce_eager,
             compilation_config=comp_cfg,
             tensor_parallel_size=args.consumer_tensor_parallel_size,
+            data_parallel_size=None if consumer_external_dp
+            else args.consumer_data_parallel_size,
             kv_transfer_config=_resolve_kv_transfer_config(
                 args.consumer_kv_transfer_config or args.kv_transfer_config_template,
                 port,
                 args.kv_owner_state_url,
                 args.shared_kv_pool_enable,
-                args.shared_kv_pool_meta_path,
+                shard_meta_path,
                 args.shared_kv_pool_wait_timeout_s,
                 args.shared_kv_pool_poll_s,
                 "consumer",
@@ -705,7 +822,8 @@ def main() -> int:
     consumer_active_profile: dict[int, bool] = {}
     for idx, p in enumerate(consumer_ports):
         use_active = False
-        children.append(_start(_consumer_cmd(p, use_active), _consumer_env(idx)))
+        children.append(
+            _start(_consumer_cmd(p, use_active, idx), _consumer_env(idx)))
         consumer_active_profile[p] = use_active
 
     dynamic_active_upstream: str | None = None
@@ -745,7 +863,9 @@ def main() -> int:
                     )
                     child_idx = i + 1
                     _stop_proc(children[child_idx])
-                    children[child_idx] = _start(_consumer_cmd(port, should_active), _consumer_env(i))
+                    children[child_idx] = _start(
+                        _consumer_cmd(port, should_active, i),
+                        _consumer_env(i))
                     consumer_active_profile[port] = should_active
                     try:
                         _wait_owner_ready(f"http://127.0.0.1:{port}",

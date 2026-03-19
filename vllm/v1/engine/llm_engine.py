@@ -304,6 +304,9 @@ class LLMEngine:
     def reset_prefix_cache(self, device: Optional[Device] = None):
         self.engine_core.reset_prefix_cache()
 
+    def reset_hop_state(self):
+        self.engine_core.reset_hop_state()
+
     def sleep(self, level: int = 1):
         self.engine_core.sleep(level)
 

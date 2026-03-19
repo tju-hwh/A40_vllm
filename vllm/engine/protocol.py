@@ -295,6 +295,11 @@ class EngineClient(ABC):
         ...
 
     @abstractmethod
+    async def reset_hop_state(self) -> None:
+        """Reset hop-specific KV/shared allocator state."""
+        ...
+
+    @abstractmethod
     async def sleep(self, level: int = 1) -> None:
         """Sleep the engine"""
         ...

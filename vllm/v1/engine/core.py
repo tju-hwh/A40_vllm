@@ -758,7 +758,8 @@ class EngineCoreProc(EngineCore):
         # Post-step hook.
         self.post_step(model_executed)
 
-        return model_executed
+    def reset_hop_state(self):
+        return self.scheduler.reset_hop_state()
 
     def _handle_client_request(self, request_type: EngineCoreRequestType,
                                request: Any) -> None:

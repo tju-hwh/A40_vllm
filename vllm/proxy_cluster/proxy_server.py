@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -39,6 +40,9 @@ class ProxyConfig:
     sequential_block_size: int
     sequential_targets: list[str]
     sequential_target_kv_ports: list[int]
+    sequential_target_dp_sizes: list[int]
+    sequential_target_groups: list[list[str]]
+    sequential_target_kv_port_groups: list[list[int]]
     sequential_decode_tokens: list[int]
     request_timeout_s: float
     connect_timeout_s: float
@@ -102,6 +106,76 @@ class ProxyConfig:
             # This is not suitable for P2pNcclConnector, but keeps old behavior.
             kv_ports = [_target_host_port(t)[1] for t in seq_targets]
 
+        dp_sizes_raw = os.getenv("SEQUENTIAL_TARGET_DP_SIZES", "").strip()
+        dp_sizes = [int(x.strip()) for x in dp_sizes_raw.split(",") if x.strip()] if dp_sizes_raw else []
+        if dp_sizes and len(dp_sizes) != len(seq_targets):
+            raise ValueError(
+                f"SEQUENTIAL_TARGET_DP_SIZES size ({len(dp_sizes)}) must equal SEQUENTIAL_TARGETS size ({len(seq_targets)})"
+            )
+        if not dp_sizes:
+            dp_sizes = [1] * len(seq_targets)
+        if any(x <= 0 for x in dp_sizes):
+            raise ValueError(
+                f"SEQUENTIAL_TARGET_DP_SIZES must be positive integers, got {dp_sizes!r}"
+            )
+
+        seq_target_groups_raw = os.getenv("SEQUENTIAL_TARGET_GROUPS", "").strip()
+        if seq_target_groups_raw:
+            seq_target_groups = []
+            for group_raw in seq_target_groups_raw.split(";"):
+                group = [_strip_slash(x.strip()) for x in group_raw.split(",")
+                         if x.strip()]
+                if not group:
+                    raise ValueError(
+                        f"SEQUENTIAL_TARGET_GROUPS contains an empty group: {seq_target_groups_raw!r}"
+                    )
+                seq_target_groups.append(group)
+        else:
+            seq_target_groups = [[t] for t in seq_targets]
+
+        seq_target_kv_port_groups_raw = os.getenv(
+            "SEQUENTIAL_TARGET_KV_PORT_GROUPS", "").strip()
+        if seq_target_kv_port_groups_raw:
+            seq_target_kv_port_groups = []
+            for group_raw in seq_target_kv_port_groups_raw.split(";"):
+                group = [int(x.strip()) for x in group_raw.split(",")
+                         if x.strip()]
+                if not group:
+                    raise ValueError(
+                        "SEQUENTIAL_TARGET_KV_PORT_GROUPS contains an empty "
+                        f"group: {seq_target_kv_port_groups_raw!r}"
+                    )
+                seq_target_kv_port_groups.append(group)
+        else:
+            seq_target_kv_port_groups = [[p] for p in kv_ports]
+
+        if len(seq_target_groups) != len(seq_targets):
+            raise ValueError(
+                "SEQUENTIAL_TARGET_GROUPS size "
+                f"({len(seq_target_groups)}) must equal SEQUENTIAL_TARGETS size "
+                f"({len(seq_targets)})"
+            )
+        if len(seq_target_kv_port_groups) != len(seq_targets):
+            raise ValueError(
+                "SEQUENTIAL_TARGET_KV_PORT_GROUPS size "
+                f"({len(seq_target_kv_port_groups)}) must equal "
+                f"SEQUENTIAL_TARGETS size ({len(seq_targets)})"
+            )
+        for idx, group in enumerate(seq_target_groups):
+            if len(group) != len(seq_target_kv_port_groups[idx]):
+                raise ValueError(
+                    "SEQUENTIAL_TARGET_GROUPS and "
+                    "SEQUENTIAL_TARGET_KV_PORT_GROUPS must align per group: "
+                    f"group_idx={idx} urls={group!r} kv_ports="
+                    f"{seq_target_kv_port_groups[idx]!r}"
+                )
+            expected_dp = dp_sizes[idx]
+            if expected_dp != len(group):
+                raise ValueError(
+                    "SEQUENTIAL_TARGET_DP_SIZES must equal target group size: "
+                    f"group_idx={idx} dp_size={expected_dp} group={group!r}"
+                )
+
         seq_decode_tokens_raw = os.getenv("SEQUENTIAL_DECODE_TOKENS", "").strip()
         seq_decode_tokens = [
             int(x.strip()) for x in seq_decode_tokens_raw.split(",") if x.strip()
@@ -120,6 +194,9 @@ class ProxyConfig:
             sequential_block_size=block_size,
             sequential_targets=seq_targets,
             sequential_target_kv_ports=kv_ports,
+            sequential_target_dp_sizes=dp_sizes,
+            sequential_target_groups=seq_target_groups,
+            sequential_target_kv_port_groups=seq_target_kv_port_groups,
             sequential_decode_tokens=seq_decode_tokens,
             request_timeout_s=float(os.getenv("REQUEST_TIMEOUT_S", "300")),
             connect_timeout_s=float(os.getenv("CONNECT_TIMEOUT_S", "30")),
@@ -271,6 +348,29 @@ class RouteState:
                 self._phase_cond.notify_all()
 
 
+def _stable_dp_rank(request_id: str, dp_size: int) -> int:
+    if dp_size <= 1:
+        return 0
+    digest = hashlib.md5(request_id.encode("utf-8"), usedforsecurity=False).digest()
+    return int.from_bytes(digest[:8], "big") % dp_size
+
+
+def _resolve_stage_target(
+    cfg: ProxyConfig,
+    stage_idx: int,
+    request_dp_rank_seed: Optional[int],
+    base_request_id: str,
+) -> tuple[str, int, int]:
+    urls = cfg.sequential_target_groups[stage_idx]
+    kv_ports = cfg.sequential_target_kv_port_groups[stage_idx]
+    target_dp_size = len(urls)
+    if request_dp_rank_seed is None:
+        hop_dp_rank = _stable_dp_rank(base_request_id, target_dp_size)
+    else:
+        hop_dp_rank = request_dp_rank_seed % max(1, target_dp_size)
+    return urls[hop_dp_rank], kv_ports[hop_dp_rank], hop_dp_rank
+
+
 def _is_stream_request(body: bytes, content_type: str | None) -> bool:
     if not body:
         return False
@@ -331,15 +431,21 @@ def _target_host_port(target_base: str) -> tuple[str, int]:
 
 
 def _build_p2p_request_id(base_request_id: str, prev_target: str | None,
-                          prev_kv_port: int | None, next_target: str | None,
-                          next_kv_port: int | None) -> str:
+                          prev_kv_port: int | None, prev_dp_rank: int | None,
+                          next_target: str | None, next_kv_port: int | None,
+                          next_dp_rank: int | None) -> str:
     rid = base_request_id
     if prev_target:
         phost, _ = _target_host_port(prev_target)
-        rid += f"___prefill_addr_{phost}:{int(prev_kv_port)}___"
+        rid += f"___prefill_addr_{phost}:{int(prev_kv_port)}"
+        if prev_dp_rank is not None:
+            rid += f"@dp{int(prev_dp_rank)}"
+        rid += "___"
     if next_target:
         dhost, _ = _target_host_port(next_target)
         rid += f"___decode_addr_{dhost}:{int(next_kv_port)}"
+        if next_dp_rank is not None:
+            rid += f"@dp{int(next_dp_rank)}"
     return rid
 
 
@@ -704,6 +810,9 @@ async def _handle_completion_sequential_handoff(
     last_resp: dict[str, Any] | None = None
     first_id = req_obj.get("request_id")
     base_request_id = str(first_id) if first_id else f"handoff-{uuid.uuid4().hex}"
+    explicit_dp_rank = req_obj.get("data_parallel_rank")
+    explicit_dp_rank = explicit_dp_rank if isinstance(explicit_dp_rank, int) and explicit_dp_rank >= 0 else None
+    request_dp_rank_seed = explicit_dp_rank
     # Prevent state bleed when clients accidentally reuse request_id.
     await kv_owner_reset(base_request_id)
     phase_wave = await state.phase_enter_hop1()
@@ -712,6 +821,13 @@ async def _handle_completion_sequential_handoff(
 
     for hop_idx, (target_base, hop_max_tokens) in enumerate(plan, start=1):
         is_last_hop = hop_idx == len(plan)
+        stage_idx = hop_idx - 1
+        target_dp_size = cfg.sequential_target_dp_sizes[stage_idx]
+        if request_dp_rank_seed is None:
+            hop_dp_rank = _stable_dp_rank(base_request_id, target_dp_size)
+        else:
+            hop_dp_rank = request_dp_rank_seed % max(1, target_dp_size)
+        target_base = cfg.sequential_target_groups[stage_idx][hop_dp_rank]
         await state.add_target_hit(target_base)
         # Dynamic KV profile switch: only consumers (server2/3/4) are toggled.
         if cfg.dynamic_kv_control_path:
@@ -737,14 +853,28 @@ async def _handle_completion_sequential_handoff(
                             "decode_idx": decode_idx,
                         },
                     )
-        prev_target = plan[hop_idx - 2][0] if hop_idx > 1 else None
-        next_target = plan[hop_idx][0] if hop_idx < len(plan) else None
-        target_index = cfg.sequential_targets.index(target_base)
-        prev_kv_port = cfg.sequential_target_kv_ports[target_index - 1] if hop_idx > 1 else None
-        next_kv_port = cfg.sequential_target_kv_ports[target_index + 1] if hop_idx < len(plan) else None
+        prev_target = None
+        prev_kv_port = None
+        next_target = None
+        next_kv_port = None
+        if hop_idx > 1:
+            prev_stage_idx = stage_idx - 1
+            prev_target = cfg.sequential_target_groups[prev_stage_idx][hop_dp_rank]
+            prev_kv_port = cfg.sequential_target_kv_port_groups[prev_stage_idx][hop_dp_rank]
+        if hop_idx < len(plan):
+            next_stage_idx = stage_idx + 1
+            next_target = cfg.sequential_target_groups[next_stage_idx][hop_dp_rank]
+            next_kv_port = cfg.sequential_target_kv_port_groups[next_stage_idx][hop_dp_rank]
 
         hop_req = dict(req_obj)
         hop_req["stream"] = False
+        if cfg.verbose_log:
+            print(
+                "[proxy:sequential_handoff] "
+                f"base_request_id={base_request_id} hop={hop_idx}/{len(plan)} "
+                f"target={target_base} target_dp_size={target_dp_size} "
+                f"explicit_dp_rank={explicit_dp_rank} chosen_dp_rank={hop_dp_rank}"
+            )
         # For non-first hops, include text generated so far in prompt so the
         # destination scheduler can account for full context length. KV handoff
         # remains enabled and should avoid recomputing most of this context.
@@ -809,9 +939,16 @@ async def _handle_completion_sequential_handoff(
             base_request_id,
             prev_target,
             prev_kv_port,
+            hop_dp_rank if hop_idx > 1 else None,
             next_target,
             next_kv_port,
+            hop_dp_rank if hop_idx < len(plan) else None,
         )
+        if cfg.sequential_target_dp_sizes[stage_idx] > 1 and \
+                len(cfg.sequential_target_groups[stage_idx]) > 1:
+            hop_req.pop("data_parallel_rank", None)
+        else:
+            hop_req["data_parallel_rank"] = hop_dp_rank
         fast_phase_handoff = (
             cfg.kv_handoff_global_phase_barrier
             and len(cfg.sequential_targets) == 2
@@ -1135,6 +1272,9 @@ def create_app() -> FastAPI:
             "sequential_block_size": cfg.sequential_block_size,
             "sequential_targets": cfg.sequential_targets,
             "sequential_target_kv_ports": cfg.sequential_target_kv_ports,
+            "sequential_target_dp_sizes": cfg.sequential_target_dp_sizes,
+            "sequential_target_groups": cfg.sequential_target_groups,
+            "sequential_target_kv_port_groups": cfg.sequential_target_kv_port_groups,
             "sequential_decode_tokens": cfg.sequential_decode_tokens,
             "kv_handoff_serial_barrier": cfg.kv_handoff_serial_barrier,
             "kv_handoff_min_layers": cfg.kv_handoff_min_layers,

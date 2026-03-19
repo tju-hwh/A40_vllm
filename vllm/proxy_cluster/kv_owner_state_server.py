@@ -73,6 +73,10 @@ class ResetReq(BaseModel):
     request_id: str
 
 
+class ResetAllReq(BaseModel):
+    confirm: bool = True
+
+
 class RegisterKVBatchReq(BaseModel):
     items: list[RegisterKVReq]
 
@@ -315,5 +319,13 @@ def create_app() -> FastAPI:
         rid = _canonical_request_id(req.request_id)
         states.pop(rid, None)
         return {"ok": True, "request_id": rid}
+
+    @app.post("/reset_all")
+    async def reset_all(req: ResetAllReq) -> dict[str, Any]:
+        if not req.confirm:
+            return {"ok": False, "error": "confirm_required"}
+        count = len(states)
+        states.clear()
+        return {"ok": True, "cleared_requests": count}
 
     return app
