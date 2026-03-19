@@ -177,6 +177,34 @@ def _parse_csv_ints(raw: str) -> list[int]:
     return vals
 
 
+def _normalize_compilation_config_arg(raw: str | None) -> str | None:
+    if not raw:
+        return None
+    try:
+        obj = json.loads(raw)
+    except Exception:
+        return raw
+    if not isinstance(obj, dict):
+        return raw
+
+    # A partial config like {"level":3,"use_inductor":true,"use_cudagraph":true}
+    # overrides vLLM defaults but leaves graph capture details unset. In
+    # practice this degrades consumer throughput because the effective
+    # cudagraph mode/capture sizes become incomplete. Treat this shorthand as
+    # "use vLLM's default high-performance compilation config" instead.
+    known_shorthand_keys = {"level", "use_inductor", "use_cudagraph"}
+    if set(obj.keys()).issubset(known_shorthand_keys):
+        if (int(obj.get("level", 0)) == 0
+                and not bool(obj.get("use_inductor", False))
+                and not bool(obj.get("use_cudagraph", False))):
+            return None
+        if (int(obj.get("level", 0)) >= 3
+                and bool(obj.get("use_inductor", False))
+                and bool(obj.get("use_cudagraph", False))):
+            return None
+    return raw
+
+
 def _split_visible_devices(raw: str, tp_size: int,
                            dp_size: int, role: str) -> list[str]:
     devices = _parse_csv(raw)
@@ -209,8 +237,10 @@ def _shared_meta_path_for_shard(base_meta_path: str, dp_idx: int,
 
 def _resolve_kv_transfer_config(raw: str | None,
                                 port: int,
+                                kv_port: int | None = None,
                                 kv_owner_state_url: str = "",
                                 shared_kv_pool_enable: bool = False,
+                                shared_block_table_enable: bool | None = None,
                                 shared_kv_pool_meta_path: str = "",
                                 shared_kv_pool_wait_timeout_s: float = 300.0,
                                 shared_kv_pool_poll_s: float = 0.1,
@@ -231,6 +261,8 @@ def _resolve_kv_transfer_config(raw: str | None,
     connector = obj.get("kv_connector")
     if connector not in {"P2pNcclConnector", "CudaIpcConnector"}:
         return replaced
+    if kv_port is not None:
+        obj["kv_port"] = int(kv_port)
 
     extra = obj.get("kv_connector_extra_config")
     if not isinstance(extra, dict):
@@ -240,10 +272,16 @@ def _resolve_kv_transfer_config(raw: str | None,
         extra.setdefault("http_port", int(port))
     if connector == "CudaIpcConnector" and kv_owner_state_url:
         extra.setdefault("kv_owner_state_url", kv_owner_state_url)
-    if connector == "CudaIpcConnector" and shared_kv_pool_enable:
-        extra.setdefault("shared_kv_pool_enable", True)
-        # Enable request-level global block table when shared KV pool is on.
-        extra.setdefault("shared_block_table_enable", True)
+    if connector == "CudaIpcConnector":
+        extra["shared_kv_pool_enable"] = bool(shared_kv_pool_enable)
+        if shared_block_table_enable is not None:
+            extra["shared_block_table_enable"] = bool(
+                shared_block_table_enable)
+        elif shared_kv_pool_enable:
+            # Enable request-level global block table when shared KV pool is on.
+            extra.setdefault("shared_block_table_enable", True)
+    if connector == "CudaIpcConnector" and (shared_kv_pool_enable
+                                            or shared_block_table_enable):
         if shared_kv_pool_role:
             extra.setdefault("shared_kv_pool_role", shared_kv_pool_role)
         if shared_kv_pool_meta_path:
@@ -299,6 +337,30 @@ def main() -> int:
     parser.add_argument("--server2-port", type=int, default=8102, help="Consumer vLLM server port.")
     parser.add_argument("--server3-port", type=int, default=8103, help="Consumer vLLM server port.")
     parser.add_argument("--server4-port", type=int, default=8104, help="Consumer vLLM server port.")
+    parser.add_argument(
+        "--server1-kv-port",
+        type=int,
+        default=18101,
+        help="Owner KV connector base port for logical stage 1.",
+    )
+    parser.add_argument(
+        "--server2-kv-port",
+        type=int,
+        default=18102,
+        help="Consumer KV connector base port for logical stage 2.",
+    )
+    parser.add_argument(
+        "--server3-kv-port",
+        type=int,
+        default=18103,
+        help="Consumer KV connector base port for logical stage 3.",
+    )
+    parser.add_argument(
+        "--server4-kv-port",
+        type=int,
+        default=18104,
+        help="Consumer KV connector base port for logical stage 4.",
+    )
     parser.add_argument(
         "--ipc-meta-path",
         default="/tmp/vllm_ipc_meta.pkl",
@@ -543,6 +605,15 @@ def main() -> int:
         help="Metadata path for experimental shared KV pool CUDA IPC handles.",
     )
     parser.add_argument(
+        "--consumer-disable-zero-copy-shared-pool",
+        action="store_true",
+        help=(
+            "Keep shared block table on consumers but disable zero-copy "
+            "shared KV pool mode so consumers rebuild/load local KV before "
+            "continuing decode."
+        ),
+    )
+    parser.add_argument(
         "--shared-kv-pool-wait-timeout-s",
         type=float,
         default=300.0,
@@ -616,12 +687,25 @@ def main() -> int:
                                            args.owner_data_parallel_size)
         consumer_ports_external = _logical_stage_ports(args.server2_port,
                                                        args.consumer_data_parallel_size)
+        owner_kv_ports = _logical_stage_ports(args.server1_kv_port,
+                                              args.owner_data_parallel_size)
+        consumer_kv_ports_external = _logical_stage_ports(
+            args.server2_kv_port, args.consumer_data_parallel_size)
         urls = [f"http://127.0.0.1:{p}" for p in owner_ports + consumer_ports_external]
     else:
         owner_shards = []
         consumer_shards = []
         owner_ports = [args.server1_port]
         consumer_ports_external = ports[1:]
+        owner_kv_ports = [args.server1_kv_port]
+        consumer_kv_ports_external = [
+            args.server2_kv_port,
+            args.server3_kv_port,
+            args.server4_kv_port,
+        ][:max(0, args.num_servers - 1)]
+    consumer_kv_port_by_port = {
+        p: kv for p, kv in zip(consumer_ports_external, consumer_kv_ports_external)
+    }
 
     try:
         os.remove(args.ipc_meta_path)
@@ -686,6 +770,7 @@ def main() -> int:
     def _owner_cmd(port: int, dp_idx: int) -> list[str]:
         shard_meta_path = _shared_meta_path_for_shard(
             args.shared_kv_pool_meta_path, dp_idx, owner_external_dp)
+        kv_port = owner_kv_ports[dp_idx if owner_external_dp else 0]
         return _build_vllm_cmd(
             host=host,
             port=port,
@@ -698,15 +783,18 @@ def main() -> int:
             gpu_memory_utilization=args.owner_gpu_memory_utilization,
             max_num_seqs=args.owner_max_num_seqs,
             max_model_len=args.owner_max_model_len,
-            compilation_config=(args.owner_compilation_config or None),
+            compilation_config=_normalize_compilation_config_arg(
+                args.owner_compilation_config),
             tensor_parallel_size=args.owner_tensor_parallel_size,
             data_parallel_size=None if owner_external_dp
             else args.owner_data_parallel_size,
             kv_transfer_config=_resolve_kv_transfer_config(
                 args.owner_kv_transfer_config or args.kv_transfer_config_template,
                 port,
+                kv_port,
                 args.kv_owner_state_url,
                 args.shared_kv_pool_enable,
+                True if args.shared_kv_pool_enable else None,
                 shard_meta_path,
                 args.shared_kv_pool_wait_timeout_s,
                 args.shared_kv_pool_poll_s,
@@ -777,6 +865,13 @@ def main() -> int:
             else args.consumer_max_num_seqs
         shard_meta_path = _shared_meta_path_for_shard(
             args.shared_kv_pool_meta_path, dp_idx, consumer_external_dp)
+        kv_port = (consumer_kv_ports_external[dp_idx]
+                   if consumer_external_dp
+                   else consumer_kv_port_by_port[port])
+        consumer_zero_copy = (
+            args.shared_kv_pool_enable
+            and not args.consumer_disable_zero_copy_shared_pool
+        )
         if consumer_external_dp:
             per_server_comp_cfg = args.server2_compilation_config
         else:
@@ -786,6 +881,7 @@ def main() -> int:
                 args.server4_port: args.server4_compilation_config,
             }.get(port, "")
         comp_cfg = per_server_comp_cfg or args.consumer_compilation_config
+        comp_cfg = _normalize_compilation_config_arg(comp_cfg)
         return _build_vllm_cmd(
             host=host,
             port=port,
@@ -806,8 +902,10 @@ def main() -> int:
             kv_transfer_config=_resolve_kv_transfer_config(
                 args.consumer_kv_transfer_config or args.kv_transfer_config_template,
                 port,
+                kv_port,
                 args.kv_owner_state_url,
-                args.shared_kv_pool_enable,
+                consumer_zero_copy,
+                True if args.shared_kv_pool_enable else None,
                 shard_meta_path,
                 args.shared_kv_pool_wait_timeout_s,
                 args.shared_kv_pool_poll_s,

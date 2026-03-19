@@ -133,6 +133,7 @@ class CudaIpcConnector(KVConnectorBase_V1):
         self._inflight_exports: dict[str, tuple[torch.Tensor, float]] = {}
         self._warned_mismatch: set[str] = set()
         self._warned_skip_reexport: set[str] = set()
+        self._logged_external_match: set[str] = set()
         # Consumer-side: request is loaded from remote KV once.
         self._recv_loaded_once: set[str] = set()
         # Producer-side: delay send-path until near handoff cutover.
@@ -611,8 +612,6 @@ class CudaIpcConnector(KVConnectorBase_V1):
             self, finished_req_ids: set[str],
             **kwargs: Any) -> tuple[Optional[set[str]], Optional[set[str]]]:
         del kwargs
-        if self._zero_copy_shared_pool_mode and not self._tp_primary:
-            return None, None
         # Only report producer-side async sends that have actually matured.
         # Ordinary completed requests must not be surfaced as
         # "finished_sending", otherwise the scheduler treats consumer-side
@@ -653,12 +652,23 @@ class CudaIpcConnector(KVConnectorBase_V1):
         num_external_tokens = len(request.prompt_token_ids) - 1 - num_computed_tokens
         if num_external_tokens < 0:
             num_external_tokens = 0
+        req_norm = self.normalize_request_id(request.request_id)
+        if req_norm not in self._logged_external_match:
+            self._logged_external_match.add(req_norm)
+            logger.info(
+                "consumer external-prefix req=%s prompt_tokens=%d num_computed_tokens=%d external_tokens=%d zero_copy=%s tp_primary=%s",
+                req_norm,
+                len(request.prompt_token_ids),
+                num_computed_tokens,
+                num_external_tokens,
+                self._zero_copy_shared_pool_mode,
+                self._tp_primary,
+            )
         return num_external_tokens, False
 
     def update_state_after_alloc(self, request: "Request",
                                  blocks: "KVCacheBlocks",
                                  num_external_tokens: int):
-        del blocks
         if self.can_recv and self.has_prefill_addr(
                 request.request_id) and num_external_tokens > 0:
             if self._zero_copy_shared_pool_mode and not self._tp_primary:
@@ -673,8 +683,6 @@ class CudaIpcConnector(KVConnectorBase_V1):
         scheduler_output: SchedulerOutput,
     ) -> KVConnectorMetadata:
         meta = CudaIpcConnectorMetadata()
-        if self._zero_copy_shared_pool_mode and not self._tp_primary:
-            return meta
         seen_req_ids: set[str] = set()
 
         def _first_group_block_ids(

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 import logging
 import os
@@ -239,6 +238,9 @@ class RouteState:
         self._hop1_active = 0
         self._hop2_active = 0
         self._pending_hop2 = 0
+        self._dp_rr_cursor_by_size: dict[int, int] = {}
+        self._request_dp_ranks: dict[str, int] = {}
+        self._active_dp_counts_by_size: dict[int, list[int]] = {}
 
     async def choose_target(self, path: str) -> tuple[str, Optional[int], str]:
         """Return target upstream, decode_idx (if counted), and route label."""
@@ -276,6 +278,51 @@ class RouteState:
     async def add_target_hit(self, target: str) -> None:
         async with self._lock:
             self.decode_target_counts[target] = self.decode_target_counts.get(target, 0) + 1
+
+    async def assign_dp_rank(
+        self,
+        request_id: str,
+        dp_size: int,
+        explicit_dp_rank: Optional[int] = None,
+    ) -> int:
+        if dp_size <= 1:
+            return 0
+        async with self._lock:
+            existing = self._request_dp_ranks.get(request_id)
+            if existing is not None:
+                return existing
+            if explicit_dp_rank is not None and explicit_dp_rank >= 0:
+                rank = explicit_dp_rank % dp_size
+            else:
+                active = self._active_dp_counts_by_size.setdefault(
+                    dp_size, [0] * dp_size)
+                min_active = min(active)
+                candidates = [
+                    idx for idx, cnt in enumerate(active) if cnt == min_active
+                ]
+                cursor = self._dp_rr_cursor_by_size.get(dp_size, 0)
+                rank = min(
+                    candidates,
+                    key=lambda idx: ((idx - cursor) % dp_size, idx),
+                )
+                self._dp_rr_cursor_by_size[dp_size] = (rank + 1) % dp_size
+            self._request_dp_ranks[request_id] = rank
+            active = self._active_dp_counts_by_size.setdefault(
+                dp_size, [0] * dp_size)
+            active[rank] += 1
+            return rank
+
+    async def release_dp_rank(self, request_id: str, dp_size: int) -> None:
+        if dp_size <= 1:
+            return
+        async with self._lock:
+            rank = self._request_dp_ranks.pop(request_id, None)
+            if rank is None:
+                return
+            active = self._active_dp_counts_by_size.get(dp_size)
+            if active is None or not (0 <= rank < len(active)):
+                return
+            active[rank] = max(0, active[rank] - 1)
 
     def _phase_barrier_enabled(self) -> bool:
         return (self.cfg.routing_mode == "sequential_handoff"
@@ -347,14 +394,6 @@ class RouteState:
                 self._phase_wave = max(self._phase_wave, wave + 1)
                 self._phase_cond.notify_all()
 
-
-def _stable_dp_rank(request_id: str, dp_size: int) -> int:
-    if dp_size <= 1:
-        return 0
-    digest = hashlib.md5(request_id.encode("utf-8"), usedforsecurity=False).digest()
-    return int.from_bytes(digest[:8], "big") % dp_size
-
-
 def _resolve_stage_target(
     cfg: ProxyConfig,
     stage_idx: int,
@@ -365,7 +404,7 @@ def _resolve_stage_target(
     kv_ports = cfg.sequential_target_kv_port_groups[stage_idx]
     target_dp_size = len(urls)
     if request_dp_rank_seed is None:
-        hop_dp_rank = _stable_dp_rank(base_request_id, target_dp_size)
+        hop_dp_rank = 0
     else:
         hop_dp_rank = request_dp_rank_seed % max(1, target_dp_size)
     return urls[hop_dp_rank], kv_ports[hop_dp_rank], hop_dp_rank
@@ -812,429 +851,439 @@ async def _handle_completion_sequential_handoff(
     base_request_id = str(first_id) if first_id else f"handoff-{uuid.uuid4().hex}"
     explicit_dp_rank = req_obj.get("data_parallel_rank")
     explicit_dp_rank = explicit_dp_rank if isinstance(explicit_dp_rank, int) and explicit_dp_rank >= 0 else None
-    request_dp_rank_seed = explicit_dp_rank
+    first_stage_dp_size = cfg.sequential_target_dp_sizes[0] if cfg.sequential_target_dp_sizes else 1
+    request_dp_rank_seed = await state.assign_dp_rank(
+        base_request_id,
+        first_stage_dp_size,
+        explicit_dp_rank=explicit_dp_rank,
+    )
     # Prevent state bleed when clients accidentally reuse request_id.
     await kv_owner_reset(base_request_id)
     phase_wave = await state.phase_enter_hop1()
     hop1_phase_done = False
     hop2_phase_active = False
-
-    for hop_idx, (target_base, hop_max_tokens) in enumerate(plan, start=1):
-        is_last_hop = hop_idx == len(plan)
-        stage_idx = hop_idx - 1
-        target_dp_size = cfg.sequential_target_dp_sizes[stage_idx]
-        if request_dp_rank_seed is None:
-            hop_dp_rank = _stable_dp_rank(base_request_id, target_dp_size)
-        else:
+    try:
+        for hop_idx, (target_base, hop_max_tokens) in enumerate(plan, start=1):
+            is_last_hop = hop_idx == len(plan)
+            stage_idx = hop_idx - 1
+            target_dp_size = cfg.sequential_target_dp_sizes[stage_idx]
             hop_dp_rank = request_dp_rank_seed % max(1, target_dp_size)
-        target_base = cfg.sequential_target_groups[stage_idx][hop_dp_rank]
-        await state.add_target_hit(target_base)
-        # Dynamic KV profile switch: only consumers (server2/3/4) are toggled.
-        if cfg.dynamic_kv_control_path:
-            # Only switch dynamic KV profile when the target is a consumer.
-            # Avoid forcing "active->inactive" on every primary hop, which
-            # causes unnecessary restart churn and can destabilize consumers.
-            if target_base != cfg.primary_upstream:
-                _write_dynamic_kv_control(cfg.dynamic_kv_control_path, target_base)
-                if cfg.dynamic_kv_settle_s > 0:
-                    await asyncio.sleep(cfg.dynamic_kv_settle_s)
-                ready = await _wait_upstream_ready(
-                    client,
-                    target_base,
-                    cfg.dynamic_kv_wait_timeout_s,
+            target_base = cfg.sequential_target_groups[stage_idx][hop_dp_rank]
+            await state.add_target_hit(target_base)
+            # Dynamic KV profile switch: only consumers (server2/3/4) are toggled.
+            if cfg.dynamic_kv_control_path:
+                # Only switch dynamic KV profile when the target is a consumer.
+                # Avoid forcing "active->inactive" on every primary hop, which
+                # causes unnecessary restart churn and can destabilize consumers.
+                if target_base != cfg.primary_upstream:
+                    _write_dynamic_kv_control(cfg.dynamic_kv_control_path, target_base)
+                    if cfg.dynamic_kv_settle_s > 0:
+                        await asyncio.sleep(cfg.dynamic_kv_settle_s)
+                    ready = await _wait_upstream_ready(
+                        client,
+                        target_base,
+                        cfg.dynamic_kv_wait_timeout_s,
+                    )
+                    if not ready:
+                        return JSONResponse(
+                            status_code=502,
+                            content={
+                                "error": "upstream_not_ready_after_dynamic_switch",
+                                "upstream": target_base,
+                                "hop": hop_idx,
+                                "decode_idx": decode_idx,
+                            },
+                        )
+            prev_target = None
+            prev_kv_port = None
+            next_target = None
+            next_kv_port = None
+            if hop_idx > 1:
+                prev_stage_idx = stage_idx - 1
+                prev_target = cfg.sequential_target_groups[prev_stage_idx][hop_dp_rank]
+                prev_kv_port = cfg.sequential_target_kv_port_groups[prev_stage_idx][hop_dp_rank]
+            if hop_idx < len(plan):
+                next_stage_idx = stage_idx + 1
+                next_target = cfg.sequential_target_groups[next_stage_idx][hop_dp_rank]
+                next_kv_port = cfg.sequential_target_kv_port_groups[next_stage_idx][hop_dp_rank]
+
+            hop_req = dict(req_obj)
+            hop_req["stream"] = False
+            if cfg.verbose_log:
+                print(
+                    "[proxy:sequential_handoff] "
+                    f"base_request_id={base_request_id} hop={hop_idx}/{len(plan)} "
+                    f"target={target_base} target_dp_size={target_dp_size} "
+                    f"explicit_dp_rank={explicit_dp_rank} chosen_dp_rank={hop_dp_rank}"
                 )
-                if not ready:
+            # For non-first hops, include text generated so far in prompt so the
+            # destination scheduler can account for full context length. KV handoff
+            # remains enabled and should avoid recomputing most of this context.
+            if hop_idx == 1:
+                hop_req["prompt"] = base_prompt
+            elif cumulative_prompt_token_ids:
+                # Use exact token history from previous hop to avoid text->token
+                # re-encoding drift across servers.
+                hop_req["prompt"] = cumulative_prompt_token_ids
+            else:
+                # Fallback path when upstream did not return token IDs.
+                if isinstance(base_prompt, str):
+                    hop_req["prompt"] = base_prompt + generated_text
+                else:
                     return JSONResponse(
                         status_code=502,
                         content={
-                            "error": "upstream_not_ready_after_dynamic_switch",
+                            "error": "missing_token_history_for_token_prompt",
+                            "detail": (
+                                "Upstream did not return cumulative token ids, "
+                                "cannot continue handoff from token-id prompt."
+                            ),
                             "upstream": target_base,
                             "hop": hop_idx,
                             "decode_idx": decode_idx,
                         },
                     )
-        prev_target = None
-        prev_kv_port = None
-        next_target = None
-        next_kv_port = None
-        if hop_idx > 1:
-            prev_stage_idx = stage_idx - 1
-            prev_target = cfg.sequential_target_groups[prev_stage_idx][hop_dp_rank]
-            prev_kv_port = cfg.sequential_target_kv_port_groups[prev_stage_idx][hop_dp_rank]
-        if hop_idx < len(plan):
-            next_stage_idx = stage_idx + 1
-            next_target = cfg.sequential_target_groups[next_stage_idx][hop_dp_rank]
-            next_kv_port = cfg.sequential_target_kv_port_groups[next_stage_idx][hop_dp_rank]
-
-        hop_req = dict(req_obj)
-        hop_req["stream"] = False
-        if cfg.verbose_log:
-            print(
-                "[proxy:sequential_handoff] "
-                f"base_request_id={base_request_id} hop={hop_idx}/{len(plan)} "
-                f"target={target_base} target_dp_size={target_dp_size} "
-                f"explicit_dp_rank={explicit_dp_rank} chosen_dp_rank={hop_dp_rank}"
+            # Guard against per-hop context overflow:
+            # input_tokens + max_tokens must not exceed upstream max_model_len.
+            effective_hop_max_tokens = int(hop_max_tokens)
+            prompt_obj = hop_req.get("prompt")
+            if isinstance(prompt_obj, list):
+                prompt_len = len(prompt_obj)
+                remain_budget = int(cfg.upstream_max_model_len) - int(prompt_len)
+                if remain_budget <= 0:
+                    if last_resp is not None:
+                        # No decode budget left at this hop. End chain gracefully.
+                        choices_obj = last_resp.get("choices")
+                        if (isinstance(choices_obj, list) and choices_obj
+                                and isinstance(choices_obj[0], dict)):
+                            choices_obj[0]["finish_reason"] = "length"
+                        break
+                    return JSONResponse(
+                        status_code=400,
+                        content={
+                            "error": "context_overflow_before_hop",
+                            "upstream": target_base,
+                            "hop": hop_idx,
+                            "prompt_tokens": prompt_len,
+                            "max_model_len": int(cfg.upstream_max_model_len),
+                            "decode_idx": decode_idx,
+                        },
+                    )
+                effective_hop_max_tokens = min(
+                    effective_hop_max_tokens, int(remain_budget))
+            hop_req["max_tokens"] = max(1, int(effective_hop_max_tokens))
+            # Internal chaining requires exact token continuity across hops.
+            hop_req["return_token_ids"] = True
+            # Keep a stable logical request id and embed prefill/decode addrs for
+            # connectors (notably P2pNcclConnector) to resolve recv/send peers.
+            hop_req["request_id"] = _build_p2p_request_id(
+                base_request_id,
+                prev_target,
+                prev_kv_port,
+                hop_dp_rank if hop_idx > 1 else None,
+                next_target,
+                next_kv_port,
+                hop_dp_rank if hop_idx < len(plan) else None,
             )
-        # For non-first hops, include text generated so far in prompt so the
-        # destination scheduler can account for full context length. KV handoff
-        # remains enabled and should avoid recomputing most of this context.
-        if hop_idx == 1:
-            hop_req["prompt"] = base_prompt
-        elif cumulative_prompt_token_ids:
-            # Use exact token history from previous hop to avoid text->token
-            # re-encoding drift across servers.
-            hop_req["prompt"] = cumulative_prompt_token_ids
-        else:
-            # Fallback path when upstream did not return token IDs.
-            if isinstance(base_prompt, str):
-                hop_req["prompt"] = base_prompt + generated_text
+            if (cfg.sequential_target_dp_sizes[stage_idx] > 1
+                    and len(cfg.sequential_target_groups[stage_idx]) > 1):
+                hop_req.pop("data_parallel_rank", None)
             else:
+                hop_req["data_parallel_rank"] = hop_dp_rank
+            fast_phase_handoff = (
+                cfg.kv_handoff_global_phase_barrier
+                and len(cfg.sequential_targets) == 2
+                and hop_idx > 1
+            )
+            if hop_idx > 1 and not fast_phase_handoff:
+                if not await kv_owner_wait_publish_done(
+                        base_request_id, hop_idx - 1,
+                        cfg.kv_handoff_wait_timeout_s):
+                    return JSONResponse(
+                        status_code=502,
+                        content={
+                            "error": "kv_publish_done_timeout",
+                            "upstream": target_base,
+                            "hop": hop_idx,
+                            "decode_idx": decode_idx,
+                        },
+                    )
+            if hop_idx > 1 and cfg.kv_handoff_serial_barrier and not fast_phase_handoff:
+                ready = await kv_owner_wait_ready(
+                    base_request_id,
+                    cfg.kv_handoff_min_layers,
+                    cfg.kv_handoff_wait_timeout_s,
+                    cfg.kv_handoff_stable_polls,
+                    cfg.kv_handoff_soft_min_layers,
+                    hop_idx - 1,
+                )
+                if not ready:
+                    return JSONResponse(
+                        status_code=502,
+                        content={
+                            "error": "kv_handoff_barrier_timeout",
+                            "upstream": target_base,
+                            "hop": hop_idx,
+                            "decode_idx": decode_idx,
+                            "min_layers": cfg.kv_handoff_min_layers,
+                            "soft_min_layers": cfg.kv_handoff_soft_min_layers,
+                        },
+                    )
+            if not await kv_owner_acquire(base_request_id, target_base, hop_idx):
+                if cfg.kv_owner_state_strict:
+                    return JSONResponse(
+                        status_code=502,
+                        content={
+                            "error": "kv_owner_acquire_failed",
+                            "upstream": target_base,
+                            "hop": hop_idx,
+                            "decode_idx": decode_idx,
+                        },
+                    )
+            if cfg.verbose_log:
+                print(
+                    f"[proxy:{cfg.role}] handoff decode_idx={decode_idx} "
+                    f"hop={hop_idx}/{len(plan)} target={target_base} "
+                    f"max_tokens={hop_max_tokens} req_id={hop_req['request_id']}"
+                )
+            if kv_transfer_params is not None:
+                hop_kv = dict(kv_transfer_params)
+                # Only non-first hops need remote prefill (load previous KV).
+                hop_kv["do_remote_prefill"] = hop_idx > 1
+                # Only non-last hops need remote decode (export KV to next hop).
+                hop_kv["do_remote_decode"] = not is_last_hop
+                # Avoid sending kv_transfer_params for local-only hops. Some
+                # connectors still enter KV path when this field exists.
+                if hop_kv["do_remote_prefill"] or hop_kv["do_remote_decode"]:
+                    hop_req["kv_transfer_params"] = hop_kv
+
+            upstream_url = f"{target_base}{full_path}"
+            if query:
+                upstream_url = f"{upstream_url}?{query}"
+            req_task = asyncio.create_task(
+                client.request(
+                    method="POST",
+                    url=upstream_url,
+                    headers=req_headers,
+                    content=json.dumps(hop_req).encode("utf-8"),
+                ))
+            if hop_idx > 1 and not fast_phase_handoff:
+                acked = await kv_owner_wait_load_ack(
+                    base_request_id, hop_idx - 1,
+                    cfg.kv_handoff_wait_timeout_s)
+                if not acked:
+                    req_task.cancel()
+                    return JSONResponse(
+                        status_code=502,
+                        content={
+                            "error": "kv_load_ack_timeout",
+                            "upstream": target_base,
+                            "hop": hop_idx,
+                            "decode_idx": decode_idx,
+                        },
+                    )
+                if not await kv_owner_resume(base_request_id, target_base,
+                                             hop_idx - 1):
+                    req_task.cancel()
+                    return JSONResponse(
+                        status_code=502,
+                        content={
+                            "error": "kv_resume_failed",
+                            "upstream": target_base,
+                            "hop": hop_idx,
+                            "decode_idx": decode_idx,
+                        },
+                    )
+            try:
+                resp = await req_task
+            except httpx.HTTPError as exc:
+                if hop_idx == 1 and not hop1_phase_done:
+                    await state.phase_abort_hop1(phase_wave)
+                elif hop_idx > 1 and hop2_phase_active:
+                    await state.phase_abort_hop2(phase_wave)
                 return JSONResponse(
                     status_code=502,
                     content={
-                        "error": "missing_token_history_for_token_prompt",
+                        "error": "bad_gateway",
+                        "detail": str(exc),
+                        "upstream": target_base,
+                        "path": full_path,
+                        "route_label": "sequential_handoff_chain",
+                        "decode_idx": decode_idx,
+                        "hop": hop_idx,
+                    },
+                )
+            except asyncio.CancelledError:
+                if hop_idx == 1 and not hop1_phase_done:
+                    await state.phase_abort_hop1(phase_wave)
+                elif hop_idx > 1 and hop2_phase_active:
+                    await state.phase_abort_hop2(phase_wave)
+                return JSONResponse(
+                    status_code=502,
+                    content={
+                        "error": "cancelled_handoff_request",
+                        "upstream": target_base,
+                        "path": full_path,
+                        "decode_idx": decode_idx,
+                        "hop": hop_idx,
+                    },
+                )
+
+            if resp.status_code >= 400:
+                if hop_idx == 1 and not hop1_phase_done:
+                    await state.phase_abort_hop1(phase_wave)
+                elif hop_idx > 1 and hop2_phase_active:
+                    await state.phase_abort_hop2(phase_wave)
+                try:
+                    err_obj = resp.json()
+                except Exception:
+                    err_obj = {"detail": resp.text}
+                return JSONResponse(
+                    status_code=resp.status_code,
+                    content={
+                        "error": "upstream_error",
+                        "upstream": target_base,
+                        "hop": hop_idx,
+                        "detail": err_obj,
+                        "decode_idx": decode_idx,
+                    },
+                )
+
+            try:
+                resp_obj = resp.json()
+            except Exception as exc:
+                if hop_idx == 1 and not hop1_phase_done:
+                    await state.phase_abort_hop1(phase_wave)
+                elif hop_idx > 1 and hop2_phase_active:
+                    await state.phase_abort_hop2(phase_wave)
+                return JSONResponse(
+                    status_code=502,
+                    content={
+                        "error": "invalid_upstream_json",
+                        "upstream": target_base,
+                        "hop": hop_idx,
+                        "detail": str(exc),
+                        "decode_idx": decode_idx,
+                    },
+                )
+
+            hop_text = _as_completion_text(resp_obj)
+            if cfg.verbose_log:
+                print(
+                    f"[proxy:{cfg.role}] handoff decode_idx={decode_idx} "
+                    f"hop={hop_idx}/{len(plan)} done status={resp.status_code} "
+                    f"text_len={len(hop_text)}"
+                )
+            # Hop outputs are not always strictly incremental across engines.
+            # Some paths may return cumulative text; merge defensively.
+            if not generated_text:
+                generated_text = hop_text
+            elif _is_cumulative_hop_text(generated_text, hop_text):
+                generated_text = _merge_hop_text(generated_text, hop_text)
+            else:
+                generated_text = generated_text + hop_text
+            choices_obj = resp_obj.get("choices")
+            if isinstance(choices_obj, list) and choices_obj:
+                ch0 = choices_obj[0] if isinstance(choices_obj[0], dict) else {}
+                p_ids = ch0.get("prompt_token_ids")
+                o_ids = ch0.get("token_ids")
+                logprobs_obj = ch0.get("logprobs") if isinstance(ch0, dict) else None
+                if isinstance(o_ids, list) and all(isinstance(x, int) for x in o_ids):
+                    all_completion_token_ids.extend(int(x) for x in o_ids)
+                    if isinstance(p_ids, list) and all(isinstance(x, int) for x in p_ids):
+                        if first_prompt_token_ids is None:
+                            first_prompt_token_ids = list(p_ids)
+                        cumulative_prompt_token_ids = list(p_ids) + list(o_ids)
+                    elif cumulative_prompt_token_ids is not None:
+                        cumulative_prompt_token_ids = cumulative_prompt_token_ids + list(o_ids)
+                if isinstance(logprobs_obj, dict):
+                    token_logprobs = logprobs_obj.get("token_logprobs")
+                    if isinstance(token_logprobs, list):
+                        all_token_logprobs.extend(token_logprobs)
+            usage_obj = resp_obj.get("usage") or {}
+            hop_completion_tokens = (
+                int(usage_obj.get("completion_tokens", 0))
+                if isinstance(usage_obj.get("completion_tokens"), int) else 0
+            )
+            if not await kv_owner_commit(
+                    base_request_id, target_base, hop_idx,
+                    hop_completion_tokens):
+                if cfg.kv_owner_state_strict:
+                    return JSONResponse(
+                        status_code=502,
+                        content={
+                            "error": "kv_owner_commit_failed",
+                            "upstream": target_base,
+                            "hop": hop_idx,
+                            "decode_idx": decode_idx,
+                        },
+                    )
+            next_kv_transfer_params = resp_obj.get("kv_transfer_params")
+            if (not is_last_hop and cfg.require_kv_transfer
+                    and not isinstance(next_kv_transfer_params, dict)):
+                return JSONResponse(
+                    status_code=502,
+                    content={
+                        "error": "kv_transfer_unavailable",
                         "detail": (
-                            "Upstream did not return cumulative token ids, "
-                            "cannot continue handoff from token-id prompt."
+                            "Upstream did not return kv_transfer_params during sequential_handoff. "
+                            "KVConnector is likely not enabled on this server."
                         ),
                         "upstream": target_base,
                         "hop": hop_idx,
                         "decode_idx": decode_idx,
                     },
                 )
-        # Guard against per-hop context overflow:
-        # input_tokens + max_tokens must not exceed upstream max_model_len.
-        effective_hop_max_tokens = int(hop_max_tokens)
-        prompt_obj = hop_req.get("prompt")
-        if isinstance(prompt_obj, list):
-            prompt_len = len(prompt_obj)
-            remain_budget = int(cfg.upstream_max_model_len) - int(prompt_len)
-            if remain_budget <= 0:
-                if last_resp is not None:
-                    # No decode budget left at this hop. End chain gracefully.
-                    choices_obj = last_resp.get("choices")
-                    if isinstance(choices_obj, list) and choices_obj and \
-                            isinstance(choices_obj[0], dict):
-                        choices_obj[0]["finish_reason"] = "length"
-                    break
-                return JSONResponse(
-                    status_code=400,
-                    content={
-                        "error": "context_overflow_before_hop",
-                        "upstream": target_base,
-                        "hop": hop_idx,
-                        "prompt_tokens": prompt_len,
-                        "max_model_len": int(cfg.upstream_max_model_len),
-                        "decode_idx": decode_idx,
-                    },
-                )
-            effective_hop_max_tokens = min(effective_hop_max_tokens,
-                                           int(remain_budget))
-        hop_req["max_tokens"] = max(1, int(effective_hop_max_tokens))
-        # Internal chaining requires exact token continuity across hops.
-        hop_req["return_token_ids"] = True
-        # Keep a stable logical request id and embed prefill/decode addrs for
-        # connectors (notably P2pNcclConnector) to resolve recv/send peers.
-        hop_req["request_id"] = _build_p2p_request_id(
-            base_request_id,
-            prev_target,
-            prev_kv_port,
-            hop_dp_rank if hop_idx > 1 else None,
-            next_target,
-            next_kv_port,
-            hop_dp_rank if hop_idx < len(plan) else None,
-        )
-        if cfg.sequential_target_dp_sizes[stage_idx] > 1 and \
-                len(cfg.sequential_target_groups[stage_idx]) > 1:
-            hop_req.pop("data_parallel_rank", None)
-        else:
-            hop_req["data_parallel_rank"] = hop_dp_rank
-        fast_phase_handoff = (
-            cfg.kv_handoff_global_phase_barrier
-            and len(cfg.sequential_targets) == 2
-            and hop_idx > 1
-        )
-        if hop_idx > 1 and not fast_phase_handoff:
-            if not await kv_owner_wait_publish_done(
-                    base_request_id, hop_idx - 1,
-                    cfg.kv_handoff_wait_timeout_s):
-                return JSONResponse(
-                    status_code=502,
-                    content={
-                        "error": "kv_publish_done_timeout",
-                        "upstream": target_base,
-                        "hop": hop_idx,
-                        "decode_idx": decode_idx,
-                    },
-                )
-        if hop_idx > 1 and cfg.kv_handoff_serial_barrier and not fast_phase_handoff:
-            ready = await kv_owner_wait_ready(
-                base_request_id,
-                cfg.kv_handoff_min_layers,
-                cfg.kv_handoff_wait_timeout_s,
-                cfg.kv_handoff_stable_polls,
-                cfg.kv_handoff_soft_min_layers,
-                hop_idx - 1,
-            )
-            if not ready:
-                return JSONResponse(
-                    status_code=502,
-                    content={
-                        "error": "kv_handoff_barrier_timeout",
-                        "upstream": target_base,
-                        "hop": hop_idx,
-                        "decode_idx": decode_idx,
-                        "min_layers": cfg.kv_handoff_min_layers,
-                        "soft_min_layers": cfg.kv_handoff_soft_min_layers,
-                    },
-                )
-        if not await kv_owner_acquire(base_request_id, target_base, hop_idx):
-            if cfg.kv_owner_state_strict:
-                return JSONResponse(
-                    status_code=502,
-                    content={
-                        "error": "kv_owner_acquire_failed",
-                        "upstream": target_base,
-                        "hop": hop_idx,
-                        "decode_idx": decode_idx,
-                    },
-                )
-        if cfg.verbose_log:
-            print(
-                f"[proxy:{cfg.role}] handoff decode_idx={decode_idx} "
-                f"hop={hop_idx}/{len(plan)} target={target_base} "
-                f"max_tokens={hop_max_tokens} req_id={hop_req['request_id']}"
-            )
-        if kv_transfer_params is not None:
-            hop_kv = dict(kv_transfer_params)
-            # Only non-first hops need remote prefill (load previous KV).
-            hop_kv["do_remote_prefill"] = hop_idx > 1
-            # Only non-last hops need remote decode (export KV to next hop).
-            hop_kv["do_remote_decode"] = not is_last_hop
-            # Avoid sending kv_transfer_params for local-only hops. Some
-            # connectors still enter KV path when this field exists.
-            if hop_kv["do_remote_prefill"] or hop_kv["do_remote_decode"]:
-                hop_req["kv_transfer_params"] = hop_kv
+            if isinstance(next_kv_transfer_params, dict):
+                kv_transfer_params = next_kv_transfer_params
 
-        upstream_url = f"{target_base}{full_path}"
-        if query:
-            upstream_url = f"{upstream_url}?{query}"
-        req_task = asyncio.create_task(
-            client.request(
-                method="POST",
-                url=upstream_url,
-                headers=req_headers,
-                content=json.dumps(hop_req).encode("utf-8"),
-            ))
-        if hop_idx > 1 and not fast_phase_handoff:
-            acked = await kv_owner_wait_load_ack(base_request_id, hop_idx - 1,
-                                                 cfg.kv_handoff_wait_timeout_s)
-            if not acked:
-                req_task.cancel()
-                return JSONResponse(
-                    status_code=502,
-                    content={
-                        "error": "kv_load_ack_timeout",
-                        "upstream": target_base,
-                        "hop": hop_idx,
-                        "decode_idx": decode_idx,
-                    },
-                )
-            if not await kv_owner_resume(base_request_id, target_base,
-                                         hop_idx - 1):
-                req_task.cancel()
-                return JSONResponse(
-                    status_code=502,
-                    content={
-                        "error": "kv_resume_failed",
-                        "upstream": target_base,
-                        "hop": hop_idx,
-                        "decode_idx": decode_idx,
-                    },
-                )
-        try:
-            resp = await req_task
-        except httpx.HTTPError as exc:
+            usage_obj = resp_obj.get("usage") or {}
+            if first_prompt_tokens is None and isinstance(usage_obj.get("prompt_tokens"), int):
+                first_prompt_tokens = int(usage_obj["prompt_tokens"])
+            if isinstance(usage_obj.get("completion_tokens"), int):
+                sum_completion_tokens += int(usage_obj["completion_tokens"])
+            last_resp = resp_obj
+
+            # Preserve native vLLM termination semantics: if this hop already
+            # reached a terminal finish_reason (not token-limit), stop handoff.
+            finish_reason = None
+            choices_obj = resp_obj.get("choices")
+            if (isinstance(choices_obj, list) and choices_obj
+                    and isinstance(choices_obj[0], dict)):
+                finish_reason = choices_obj[0].get("finish_reason")
+            should_continue = (finish_reason is None or str(finish_reason) == "length")
             if hop_idx == 1 and not hop1_phase_done:
-                await state.phase_abort_hop1(phase_wave)
-            elif hop_idx > 1 and hop2_phase_active:
-                await state.phase_abort_hop2(phase_wave)
-            return JSONResponse(
-                status_code=502,
-                content={
-                    "error": "bad_gateway",
-                    "detail": str(exc),
-                    "upstream": target_base,
-                    "path": full_path,
-                    "route_label": "sequential_handoff_chain",
-                    "decode_idx": decode_idx,
-                    "hop": hop_idx,
-                },
-            )
-        except asyncio.CancelledError:
-            if hop_idx == 1 and not hop1_phase_done:
-                await state.phase_abort_hop1(phase_wave)
-            elif hop_idx > 1 and hop2_phase_active:
-                await state.phase_abort_hop2(phase_wave)
-            return JSONResponse(
-                status_code=502,
-                content={
-                    "error": "cancelled_handoff_request",
-                    "upstream": target_base,
-                    "path": full_path,
-                    "decode_idx": decode_idx,
-                    "hop": hop_idx,
-                },
-            )
+                hop1_phase_done = True
+                hop2_phase_active = await state.phase_finish_hop1(
+                    phase_wave, needs_hop2=(not is_last_hop and should_continue))
+            if finish_reason is not None and str(finish_reason) != "length":
+                break
 
-        if resp.status_code >= 400:
-            if hop_idx == 1 and not hop1_phase_done:
-                await state.phase_abort_hop1(phase_wave)
-            elif hop_idx > 1 and hop2_phase_active:
-                await state.phase_abort_hop2(phase_wave)
-            try:
-                err_obj = resp.json()
-            except Exception:
-                err_obj = {"detail": resp.text}
-            return JSONResponse(
-                status_code=resp.status_code,
-                content={
-                    "error": "upstream_error",
-                    "upstream": target_base,
-                    "hop": hop_idx,
-                    "detail": err_obj,
-                    "decode_idx": decode_idx,
-                },
-            )
-
-        try:
-            resp_obj = resp.json()
-        except Exception as exc:
-            if hop_idx == 1 and not hop1_phase_done:
-                await state.phase_abort_hop1(phase_wave)
-            elif hop_idx > 1 and hop2_phase_active:
-                await state.phase_abort_hop2(phase_wave)
-            return JSONResponse(
-                status_code=502,
-                content={
-                    "error": "invalid_upstream_json",
-                    "upstream": target_base,
-                    "hop": hop_idx,
-                    "detail": str(exc),
-                    "decode_idx": decode_idx,
-                },
-            )
-
-        hop_text = _as_completion_text(resp_obj)
-        if cfg.verbose_log:
-            print(
-                f"[proxy:{cfg.role}] handoff decode_idx={decode_idx} "
-                f"hop={hop_idx}/{len(plan)} done status={resp.status_code} "
-                f"text_len={len(hop_text)}"
-            )
-        # Hop outputs are not always strictly incremental across engines.
-        # Some paths may return cumulative text; merge defensively.
-        if not generated_text:
-            generated_text = hop_text
-        elif _is_cumulative_hop_text(generated_text, hop_text):
-            generated_text = _merge_hop_text(generated_text, hop_text)
-        else:
-            generated_text = generated_text + hop_text
-        choices_obj = resp_obj.get("choices")
-        if isinstance(choices_obj, list) and choices_obj:
-            ch0 = choices_obj[0] if isinstance(choices_obj[0], dict) else {}
-            p_ids = ch0.get("prompt_token_ids")
-            o_ids = ch0.get("token_ids")
-            logprobs_obj = ch0.get("logprobs") if isinstance(ch0, dict) else None
-            if isinstance(o_ids, list) and all(isinstance(x, int) for x in o_ids):
-                all_completion_token_ids.extend(int(x) for x in o_ids)
-                if isinstance(p_ids, list) and all(isinstance(x, int) for x in p_ids):
-                    if first_prompt_token_ids is None:
-                        first_prompt_token_ids = list(p_ids)
-                    cumulative_prompt_token_ids = list(p_ids) + list(o_ids)
-                elif cumulative_prompt_token_ids is not None:
-                    cumulative_prompt_token_ids = cumulative_prompt_token_ids + list(o_ids)
-            if isinstance(logprobs_obj, dict):
-                token_logprobs = logprobs_obj.get("token_logprobs")
-                if isinstance(token_logprobs, list):
-                    all_token_logprobs.extend(token_logprobs)
-        usage_obj = resp_obj.get("usage") or {}
-        hop_completion_tokens = int(usage_obj.get("completion_tokens", 0)) \
-            if isinstance(usage_obj.get("completion_tokens"), int) else 0
-        if not await kv_owner_commit(base_request_id, target_base, hop_idx,
-                                     hop_completion_tokens):
-            if cfg.kv_owner_state_strict:
-                return JSONResponse(
-                    status_code=502,
-                    content={
-                        "error": "kv_owner_commit_failed",
-                        "upstream": target_base,
-                        "hop": hop_idx,
-                        "decode_idx": decode_idx,
-                    },
-                )
-        next_kv_transfer_params = resp_obj.get("kv_transfer_params")
-        if not is_last_hop and cfg.require_kv_transfer and not isinstance(next_kv_transfer_params, dict):
-            return JSONResponse(
-                status_code=502,
-                content={
-                    "error": "kv_transfer_unavailable",
-                    "detail": (
-                        "Upstream did not return kv_transfer_params during sequential_handoff. "
-                        "KVConnector is likely not enabled on this server."
-                    ),
-                    "upstream": target_base,
-                    "hop": hop_idx,
-                    "decode_idx": decode_idx,
-                },
-            )
-        if isinstance(next_kv_transfer_params, dict):
-            kv_transfer_params = next_kv_transfer_params
-
-        usage_obj = resp_obj.get("usage") or {}
-        if first_prompt_tokens is None and isinstance(usage_obj.get("prompt_tokens"), int):
-            first_prompt_tokens = int(usage_obj["prompt_tokens"])
-        if isinstance(usage_obj.get("completion_tokens"), int):
-            sum_completion_tokens += int(usage_obj["completion_tokens"])
-        last_resp = resp_obj
-
-        # Preserve native vLLM termination semantics: if this hop already
-        # reached a terminal finish_reason (not token-limit), stop handoff.
-        finish_reason = None
-        choices_obj = resp_obj.get("choices")
-        if isinstance(choices_obj, list) and choices_obj and isinstance(choices_obj[0], dict):
-            finish_reason = choices_obj[0].get("finish_reason")
-        should_continue = (finish_reason is None or str(finish_reason) == "length")
-        if hop_idx == 1 and not hop1_phase_done:
-            hop1_phase_done = True
-            hop2_phase_active = await state.phase_finish_hop1(
-                phase_wave, needs_hop2=(not is_last_hop and should_continue))
-        if finish_reason is not None and str(finish_reason) != "length":
-            break
-
-    assert last_resp is not None
-    if hop2_phase_active:
-        await state.phase_finish_hop2(phase_wave)
-    if len(plan) > 1:
-        await kv_owner_release(base_request_id, plan[-1][0], len(plan))
-    if "choices" in last_resp and isinstance(last_resp["choices"], list) and last_resp["choices"]:
-        last_resp["choices"][0]["text"] = generated_text
-        if all_completion_token_ids:
-            last_resp["choices"][0]["token_ids"] = all_completion_token_ids
-        if first_prompt_token_ids is not None:
-            last_resp["choices"][0]["prompt_token_ids"] = first_prompt_token_ids
-        logprobs_obj = last_resp["choices"][0].get("logprobs")
-        if isinstance(logprobs_obj, dict) and all_token_logprobs:
-            logprobs_obj["token_logprobs"] = all_token_logprobs
-    usage = last_resp.get("usage")
-    if isinstance(usage, dict):
-        if first_prompt_tokens is not None:
-            usage["prompt_tokens"] = first_prompt_tokens
-        usage["completion_tokens"] = sum_completion_tokens
-        if first_prompt_tokens is not None:
-            usage["total_tokens"] = first_prompt_tokens + sum_completion_tokens
-    last_resp["kv_transfer_params"] = kv_transfer_params
-    return JSONResponse(status_code=200, content=last_resp)
+        assert last_resp is not None
+        if hop2_phase_active:
+            await state.phase_finish_hop2(phase_wave)
+        if len(plan) > 1:
+            await kv_owner_release(base_request_id, plan[-1][0], len(plan))
+        if "choices" in last_resp and isinstance(last_resp["choices"], list) and last_resp["choices"]:
+            last_resp["choices"][0]["text"] = generated_text
+            if all_completion_token_ids:
+                last_resp["choices"][0]["token_ids"] = all_completion_token_ids
+            if first_prompt_token_ids is not None:
+                last_resp["choices"][0]["prompt_token_ids"] = first_prompt_token_ids
+            logprobs_obj = last_resp["choices"][0].get("logprobs")
+            if isinstance(logprobs_obj, dict) and all_token_logprobs:
+                logprobs_obj["token_logprobs"] = all_token_logprobs
+        usage = last_resp.get("usage")
+        if isinstance(usage, dict):
+            if first_prompt_tokens is not None:
+                usage["prompt_tokens"] = first_prompt_tokens
+            usage["completion_tokens"] = sum_completion_tokens
+            if first_prompt_tokens is not None:
+                usage["total_tokens"] = first_prompt_tokens + sum_completion_tokens
+        last_resp["kv_transfer_params"] = kv_transfer_params
+        return JSONResponse(status_code=200, content=last_resp)
+    finally:
+        await state.release_dp_rank(base_request_id, first_stage_dp_size)
 
 
 def create_app() -> FastAPI:

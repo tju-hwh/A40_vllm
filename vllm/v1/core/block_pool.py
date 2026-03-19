@@ -870,6 +870,9 @@ class BlockPool:
 
         self._shared_allocator: Optional[_SharedBlockAllocator] = None
         self._post_cutover_local_tail_ids: dict[str, set[int]] = {}
+        self._post_cutover_shared_prefix_ids: dict[str, list[int]] = {}
+        self._debug_post_cutover_attach_logged: set[str] = set()
+        self._debug_post_cutover_local_tail_logged: set[str] = set()
         shared_enable = os.getenv("VLLM_SHARED_BLOCK_ALLOCATOR_ENABLE",
                                   "").strip().lower() in {
                                       "1", "true", "yes", "on"
@@ -1094,8 +1097,35 @@ class BlockPool:
             return self._get_new_blocks_local(num)
         if self._is_post_cutover_consumer(request_id):
             req_key = self._shared_allocator.canonical_request_id(request_id)
-            shared_prefix_ids = self._shared_allocator._read_req_blocks(req_key)
-            shared_len = len(shared_prefix_ids)
+            attached_shared_prefix_ids = self._post_cutover_shared_prefix_ids.get(
+                req_key)
+            if attached_shared_prefix_ids is None:
+                shared_prefix_ids = self._shared_allocator._read_req_blocks(
+                    req_key)
+                shared_len = len(shared_prefix_ids)
+                if shared_len > 0:
+                    attached_shared_prefix_ids = (
+                        self._shared_allocator.attach_existing_request_range(
+                            request_id, 0, shared_len))
+                else:
+                    attached_shared_prefix_ids = []
+                attached_shared_prefix_ids = [
+                    int(x) for x in attached_shared_prefix_ids
+                ]
+                self._post_cutover_shared_prefix_ids[req_key] = (
+                    attached_shared_prefix_ids)
+                if req_key not in self._debug_post_cutover_attach_logged:
+                    self._debug_post_cutover_attach_logged.add(req_key)
+                    logger.info(
+                        "post-cutover consumer attach req=%s shared_prefix_blocks=%d start=%d end=%d request_id=%s",
+                        req_key,
+                        len(attached_shared_prefix_ids),
+                        int(start),
+                        int(end),
+                        request_id,
+                    )
+            else:
+                shared_len = len(attached_shared_prefix_ids)
             local_tail_ids = self._post_cutover_local_tail_ids.setdefault(
                 req_key, set())
 
@@ -1104,8 +1134,7 @@ class BlockPool:
             ret: list[KVCacheBlock] = []
             shared_blocks: list[KVCacheBlock] = []
             if shared_end > shared_start:
-                block_ids = self._shared_allocator.attach_existing_request_range(
-                    request_id, shared_start, shared_end)
+                block_ids = attached_shared_prefix_ids[shared_start:shared_end]
                 for bid in block_ids:
                     block = self.blocks[bid]
                     if block.ref_cnt == 0 and not block.is_null:
@@ -1124,6 +1153,16 @@ class BlockPool:
                 local_needed_start = max(int(start), shared_len)
                 local_needed = int(end) - local_needed_start
                 if local_needed > 0:
+                    if req_key not in self._debug_post_cutover_local_tail_logged:
+                        self._debug_post_cutover_local_tail_logged.add(req_key)
+                        logger.info(
+                            "post-cutover consumer local-tail req=%s shared_prefix_blocks=%d local_tail_start=%d local_tail_blocks=%d request_id=%s",
+                            req_key,
+                            shared_len,
+                            local_needed_start,
+                            local_needed,
+                            request_id,
+                        )
                     local_blocks = self._get_new_blocks_local(local_needed)
                     for block in local_blocks:
                         local_tail_ids.add(block.block_id)
@@ -1272,6 +1311,9 @@ class BlockPool:
                 elif request_id and self._shared_allocator.is_terminal_request_id(
                         request_id):
                     self._post_cutover_local_tail_ids.pop(req_key, None)
+                if request_id and self._shared_allocator.is_terminal_request_id(
+                        request_id):
+                    self._post_cutover_shared_prefix_ids.pop(req_key, None)
             else:
                 self._shared_allocator.release(block_ids)
 
@@ -1308,6 +1350,7 @@ class BlockPool:
     def reset_hop_state(self) -> bool:
         self.cached_block_hash_to_block = BlockHashToBlockMap()
         self._post_cutover_local_tail_ids.clear()
+        self._post_cutover_shared_prefix_ids.clear()
 
         for block in self.blocks:
             block.ref_cnt = 0
