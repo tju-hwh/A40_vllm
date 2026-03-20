@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -57,6 +58,10 @@ class ProxyConfig:
     kv_handoff_global_phase_barrier: bool
     max_response_length: int
     upstream_max_model_len: int
+    # DP routing support
+    server1_urls: list[str]  # Owner URLs per DP rank
+    server2_urls: list[str]  # Consumer URLs per DP rank
+    dp_routing_strategy: str  # "round_robin" | "request_id_hash" | "random"
 
     @staticmethod
     def from_env() -> "ProxyConfig":
@@ -145,6 +150,10 @@ class ProxyConfig:
             max_response_length=max(1, int(os.getenv("MAX_RESPONSE_LENGTH", "4096"))),
             upstream_max_model_len=max(
                 1, int(os.getenv("UPSTREAM_MAX_MODEL_LEN", "3072"))),
+            # DP routing
+            server1_urls=[_strip_slash(x) for x in os.getenv("SERVER1_URLS", "").split(",") if x.strip()],
+            server2_urls=[_strip_slash(x) for x in os.getenv("SERVER2_URLS", "").split(",") if x.strip()],
+            dp_routing_strategy=os.getenv("DP_ROUTING_STRATEGY", "request_id_hash").strip().lower(),
         )
 
 
@@ -162,39 +171,103 @@ class RouteState:
         self._hop1_active = 0
         self._hop2_active = 0
         self._pending_hop2 = 0
+        # DP routing state
+        self._dp_size = max(1, len(cfg.server1_urls)) if cfg.server1_urls else 1
+        self._dp_round_robin_index = 0
 
-    async def choose_target(self, path: str) -> tuple[str, Optional[int], str]:
-        """Return target upstream, decode_idx (if counted), and route label."""
+    def _select_dp_rank(self, request_id: str | None) -> int:
+        """Select DP rank based on routing strategy."""
+        if self._dp_size <= 1:
+            return 0
+
+        strategy = self.cfg.dp_routing_strategy
+        if strategy == "round_robin":
+            rank = self._dp_round_robin_index % self._dp_size
+            self._dp_round_robin_index += 1
+            return rank
+        elif strategy == "request_id_hash":
+            # Use hash of request_id to ensure same request goes to same rank
+            if request_id:
+                h = hashlib.md5(request_id.encode(), usedforsecurity=False).hexdigest()
+                return int(h, 16) % self._dp_size
+            else:
+                # Fallback to round robin if no request_id
+                rank = self._dp_round_robin_index % self._dp_size
+                self._dp_round_robin_index += 1
+                return rank
+        else:  # random
+            import random
+            return random.randint(0, self._dp_size - 1)
+
+    def get_dp_targets(self, dp_rank: int) -> tuple[str, str, list[int]]:
+        """Get server1, server2, and KV ports for a DP rank.
+
+        Returns (server1_url, server2_url, [kv_port1, kv_port2])
+        """
+        cfg = self.cfg
+        if cfg.server1_urls and cfg.server2_urls:
+            # DP mode: use per-rank URLs
+            s1 = cfg.server1_urls[dp_rank % len(cfg.server1_urls)]
+            s2 = cfg.server2_urls[dp_rank % len(cfg.server2_urls)]
+        else:
+            # Legacy mode: use sequential_targets
+            idx = dp_rank * 2
+            targets = cfg.sequential_targets
+            s1 = targets[idx] if idx < len(targets) else targets[0]
+            s2 = targets[idx + 1] if idx + 1 < len(targets) else targets[-1]
+
+        # Get KV ports for this DP rank
+        kv_ports = cfg.sequential_target_kv_ports
+        if len(kv_ports) >= (dp_rank + 1) * 2:
+            rank_kv_ports = kv_ports[dp_rank * 2 : dp_rank * 2 + 2]
+        elif len(kv_ports) >= 2:
+            rank_kv_ports = kv_ports[:2]
+        else:
+            # Fallback to HTTP ports
+            rank_kv_ports = [_target_host_port(s1)[1], _target_host_port(s2)[1]]
+
+        return s1, s2, rank_kv_ports
+
+    async def choose_target(self, path: str, request_id: str | None = None) -> tuple[str, Optional[int], str, int]:
+        """Return target upstream, decode_idx, route label, and DP rank."""
         is_decode_path = path in {"/v1/completions", "/v1/chat/completions"}
         if self.cfg.role == "relay":
-            return self.cfg.primary_upstream, None, "relay_to_primary"
+            return self.cfg.primary_upstream, None, "relay_to_primary", 0
 
         if not is_decode_path:
-            return self.cfg.primary_upstream, None, "ingress_passthrough_primary"
+            return self.cfg.primary_upstream, None, "ingress_passthrough_primary", 0
 
         async with self._lock:
             self.decode_request_count += 1
             decode_idx = self.decode_request_count
+
+            # Select DP rank
+            dp_rank = self._select_dp_rank(request_id)
+            s1, s2, _ = self.get_dp_targets(dp_rank)
+
             if self.cfg.routing_mode == "sequential_handoff":
-                return self.cfg.sequential_targets[0], decode_idx, "sequential_handoff_chain"
+                # In DP mode, return server1 for the selected rank
+                # Handoff will happen to server2 within the same rank
+                return s1, decode_idx, f"sequential_handoff_dp{dp_rank}", dp_rank
+
             if self.cfg.routing_mode == "sequential_blocks":
                 block_idx = (decode_idx - 1) // self.cfg.sequential_block_size
                 block_idx = min(block_idx, len(self.cfg.sequential_targets) - 1)
                 target = self.cfg.sequential_targets[block_idx]
                 self.decode_target_counts[target] = self.decode_target_counts.get(target, 0) + 1
                 route_label = f"sequential_block_{block_idx + 1}"
-                return target, decode_idx, route_label
+                return target, decode_idx, route_label, 0
 
             if decode_idx <= self.cfg.cutover_requests:
                 self.decode_target_counts[self.cfg.primary_upstream] = (
                     self.decode_target_counts.get(self.cfg.primary_upstream, 0) + 1
                 )
-                return self.cfg.primary_upstream, decode_idx, "pre_cutover_primary"
+                return self.cfg.primary_upstream, decode_idx, "pre_cutover_primary", 0
 
             target = self.cfg.alt_upstreams[self.post_cutover_rr_index % len(self.cfg.alt_upstreams)]
             self.post_cutover_rr_index += 1
             self.decode_target_counts[target] = self.decode_target_counts.get(target, 0) + 1
-            return target, decode_idx, "post_cutover_alt_rr"
+            return target, decode_idx, "post_cutover_alt_rr", 0
 
     async def add_target_hit(self, target: str) -> None:
         async with self._lock:
@@ -474,7 +547,11 @@ async def _handle_completion_sequential_handoff(
     full_path: str,
     query: str,
     decode_idx: Optional[int],
+    dp_rank: int = 0,
 ) -> Response:
+    # Get the targets for this DP rank
+    rank_server1, rank_server2, rank_kv_ports = state.get_dp_targets(dp_rank)
+
     async def kv_owner_acquire(req_id: str, worker: str, hop: int) -> bool:
         if not cfg.kv_owner_state_url:
             return True
@@ -677,9 +754,11 @@ async def _handle_completion_sequential_handoff(
     if total_max_tokens <= 0:
         return JSONResponse(status_code=400, content={"error": "max_tokens must be > 0"})
 
+    # Build handoff plan using this DP rank's targets (server1 -> server2)
+    rank_targets = [rank_server1, rank_server2]
     plan = _build_handoff_plan(
         total_max_tokens=total_max_tokens,
-        targets=cfg.sequential_targets,
+        targets=rank_targets,
         cutovers=cfg.sequential_decode_tokens,
     )
     if not plan:
@@ -739,9 +818,10 @@ async def _handle_completion_sequential_handoff(
                     )
         prev_target = plan[hop_idx - 2][0] if hop_idx > 1 else None
         next_target = plan[hop_idx][0] if hop_idx < len(plan) else None
-        target_index = cfg.sequential_targets.index(target_base)
-        prev_kv_port = cfg.sequential_target_kv_ports[target_index - 1] if hop_idx > 1 else None
-        next_kv_port = cfg.sequential_target_kv_ports[target_index + 1] if hop_idx < len(plan) else None
+        # Use this DP rank's KV ports
+        target_index = rank_targets.index(target_base)
+        prev_kv_port = rank_kv_ports[target_index - 1] if hop_idx > 1 else None
+        next_kv_port = rank_kv_ports[target_index] if target_index < len(rank_kv_ports) else None
 
         hop_req = dict(req_obj)
         hop_req["stream"] = False
@@ -1145,14 +1225,17 @@ def create_app() -> FastAPI:
             "decode_target_counts": state.decode_target_counts,
             "post_cutover_rr_index": state.post_cutover_rr_index,
             "max_response_length": cfg.max_response_length,
+            # DP info
+            "dp_size": state._dp_size,
+            "dp_routing_strategy": cfg.dp_routing_strategy,
+            "server1_urls": cfg.server1_urls,
+            "server2_urls": cfg.server2_urls,
         }
 
     @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"])
     async def passthrough(path: str, request: Request) -> Response:
         client: httpx.AsyncClient = app.state.client
         full_path = "/" + path
-        target_base, decode_idx, route_label = await state.choose_target(full_path)
-        upstream_url = f"{target_base}{full_path}"
 
         body = await request.body()
         req_headers = {
@@ -1161,6 +1244,18 @@ def create_app() -> FastAPI:
             if k.lower() not in {"host", "content-length", "connection"}
         }
         query = request.url.query
+
+        # Extract request_id from body for DP routing if available
+        request_id: str | None = None
+        if full_path == "/v1/completions":
+            try:
+                body_obj = json.loads(body.decode("utf-8"))
+                request_id = body_obj.get("request_id")
+            except Exception:
+                pass
+
+        target_base, decode_idx, route_label, dp_rank = await state.choose_target(full_path, request_id)
+        upstream_url = f"{target_base}{full_path}"
         if query:
             upstream_url = f"{upstream_url}?{query}"
 
@@ -1175,6 +1270,7 @@ def create_app() -> FastAPI:
                 full_path=full_path,
                 query=query,
                 decode_idx=decode_idx,
+                dp_rank=dp_rank,
             )
 
         if cfg.verbose_log and decode_idx is not None:
