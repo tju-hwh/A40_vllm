@@ -255,7 +255,7 @@ class LLMEngine:
             self.engine_core.add_request(child_request)
 
     def step(self) -> Union[list[RequestOutput], list[PoolingRequestOutput]]:
-        print(f"v1 step")
+        # print(f"v1 step")
         if self.should_execute_dummy_batch:
             self.should_execute_dummy_batch = False
             self.engine_core.execute_dummy_batch()
