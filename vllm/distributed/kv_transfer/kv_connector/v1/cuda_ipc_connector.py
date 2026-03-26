@@ -238,8 +238,19 @@ class CudaIpcConnector(KVConnectorBase_V1):
                              if self._zero_copy_shared_pool_mode else {})
 
         if self._zero_copy_shared_pool_mode:
+            pending_req_ids: list[str] = []
+            seen_pending: set[str] = set()
             for request in metadata.requests:
                 req_id = request.request_id
+                pending_req_ids.append(req_id)
+                seen_pending.add(self.normalize_request_id(req_id))
+            for req_id in list(self._requests_need_load.keys()):
+                req_norm = self.normalize_request_id(req_id)
+                if req_norm not in seen_pending:
+                    pending_req_ids.append(req_id)
+                    seen_pending.add(req_norm)
+
+            for req_id in pending_req_ids:
                 if not self.has_prefill_addr(req_id):
                     continue
                 req_norm = self.normalize_request_id(req_id)
@@ -255,6 +266,7 @@ class CudaIpcConnector(KVConnectorBase_V1):
                     hop=1,
                 )
                 self._recv_loaded_once.add(req_norm)
+                self._requests_need_load.pop(req_id, None)
             self._gc_inflight_exports()
             return
 
@@ -776,7 +788,6 @@ class CudaIpcConnector(KVConnectorBase_V1):
                 block_ids = _first_group_block_ids(cached_reqs.new_block_ids[i])
                 _add_req_once(req_id, token_ids, block_ids)
 
-        self._requests_need_load.clear()
         return meta
 
     def request_finished(
