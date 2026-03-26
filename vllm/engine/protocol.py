@@ -295,6 +295,11 @@ class EngineClient(ABC):
         ...
 
     @abstractmethod
+    async def reset_hop_state(self) -> None:
+        """Reset hop/shared-KV state between rollout steps."""
+        ...
+
+    @abstractmethod
     async def sleep(self, level: int = 1) -> None:
         """Sleep the engine"""
         ...

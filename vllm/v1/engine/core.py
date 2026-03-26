@@ -374,6 +374,9 @@ class EngineCore:
     def reset_prefix_cache(self):
         self.scheduler.reset_prefix_cache()
 
+    def reset_hop_state(self):
+        return self.scheduler.reset_hop_state()
+
     def sleep(self, level: int = 1):
         self.model_executor.sleep(level)
 

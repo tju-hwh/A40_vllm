@@ -632,6 +632,9 @@ class AsyncLLM(EngineClient):
             raise ValueError("Not supported on CPU.")
         await self.engine_core.reset_prefix_cache_async()
 
+    async def reset_hop_state(self) -> None:
+        await self.engine_core.reset_hop_state_async()
+
     async def sleep(self, level: int = 1) -> None:
         await self.reset_prefix_cache()
         await self.engine_core.sleep_async(level)

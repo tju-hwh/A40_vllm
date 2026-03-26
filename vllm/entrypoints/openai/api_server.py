@@ -998,6 +998,12 @@ if envs.VLLM_SERVER_DEV_MODE:
         await engine_client(raw_request).reset_prefix_cache(device)
         return Response(status_code=200)
 
+    @router.post("/reset_hop_state")
+    async def reset_hop_state(raw_request: Request):
+        logger.info("Resetting hop/shared-KV state...")
+        await engine_client(raw_request).reset_hop_state()
+        return Response(status_code=200)
+
     @router.post("/sleep")
     async def sleep(raw_request: Request):
         # get POST params

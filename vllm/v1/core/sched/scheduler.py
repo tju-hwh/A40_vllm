@@ -1175,6 +1175,9 @@ class Scheduler(SchedulerInterface):
     def reset_prefix_cache(self) -> bool:
         return self.kv_cache_manager.reset_prefix_cache()
 
+    def reset_hop_state(self) -> bool:
+        return self.kv_cache_manager.reset_hop_state()
+
     def make_stats(
         self,
         spec_decoding_stats: Optional[SpecDecodingStats] = None,

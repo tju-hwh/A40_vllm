@@ -330,6 +330,9 @@ class KVCacheManager:
             self.prefix_cache_stats.reset = True
         return True
 
+    def reset_hop_state(self) -> bool:
+        return self.block_pool.reset_hop_state()
+
     def get_num_common_prefix_blocks(
         self,
         request: Request,

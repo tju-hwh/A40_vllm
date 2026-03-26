@@ -316,4 +316,11 @@ def create_app() -> FastAPI:
         states.pop(rid, None)
         return {"ok": True, "request_id": rid}
 
+    @app.post("/reset_all")
+    async def reset_all() -> dict[str, Any]:
+        count = len(states)
+        states.clear()
+        logger.info("reset_all cleared owner-state records=%s", count)
+        return {"ok": True, "cleared": count}
+
     return app
